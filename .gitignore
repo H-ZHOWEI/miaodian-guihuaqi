@@ -1,0 +1,17 @@
+# ===== 个人数据（不上传）=====
+秒点规划器配置.json
+update_config.json
+
+# ===== 更新过程临时文件 =====
+_update_tmp.exe
+_update_tmp.exe.parts/
+*.bak
+*_新版.exe
+
+# ===== Python / 构建中间产物 =====
+__pycache__/
+*.py[cod]
+build/
+
+# ===== 本地临时测试文件 =====
+_test_*.py

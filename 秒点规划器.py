@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-秒点规划器 v1.7.1
+秒点规划器 v1.8.0
 根据每个账号当前秒点余额，模拟并生成「点赞 / 登录领奖 / 复制转账 / 打包」的执行方案。
 用 Python 3.12 + tkinter，可打包为单文件 exe。
 """
@@ -23,7 +23,7 @@ import datetime
 import calendar
 
 APP_NAME = "秒点规划器"
-VERSION = "1.7.1"
+VERSION = "1.8.0"
 APP_VERSION = VERSION   # 版本更新模块使用
 
 # ===== 内置「版本更新」配置 =====
@@ -533,8 +533,8 @@ def simulate_big(ac, p, income_by_day, start_day=1, rest_days=None, pack_on_star
 
 
 def build_plan(accounts, p, ctx=None, pack_on_start=False):
-    """生成 (完整文本, csv行列表, 分板块列表)。
-    分板块列表: [(页签名, 文本), ...]，供 GUI 分页展示。
+    """生成 (完整文本, csv行列表, 分板块列表, 每日动作表)。
+    每日动作表: {日: {账号备注: [动作, ...]}}，供「确认采用」后主页面每日展示。
     """
     ctx = ctx or month_context()
     start_day = ctx["start_day"]
@@ -643,12 +643,22 @@ def build_plan(accounts, p, ctx=None, pack_on_start=False):
         s = _short_action(action)
         if s not in acts:
             acts.append(s)
+    big_login_left_daily = max(0, p["login_days_cap"] - int(big.get("login_claimed", 0)))
     for d in range(start_day, start_day + p["plan_days"]):
         week = WEEK_CN[datetime.date(ctx["year"], ctx["month"], d).weekday()]
         tag = "  ★周日休息日" if d in rest_days else ""
         sec_daily.append("  ── %d日(%s)%s" % (d, week, tag))
+        day_map = actions_by_day.setdefault(d, {})
+        # 大号的点赞/登录领奖不单独记事件，这里补上，方便逐日执行时逐号照做
+        if d not in rest_days:
+            base = "登录+点赞" if big_login_left_daily > 0 else "点赞"
+            if big_login_left_daily > 0:
+                big_login_left_daily -= 1
+            big_acts = day_map.setdefault(big["note"], [])
+            if base not in big_acts:
+                big_acts.insert(0, base)
         for note in notes:
-            acts = actions_by_day.get(d, {}).get(note, [])
+            acts = day_map.setdefault(note, [])  # 静默号也占位，方便主页面逐号展示
             sec_daily.append("      %s：%s" % (note, "、".join(acts) if acts else "静默"))
 
     # 板块4：小号复制排期
@@ -726,7 +736,7 @@ def build_plan(accounts, p, ctx=None, pack_on_start=False):
     for d, action, amt, bal in bev:
         rows.append([d, "大号", big["note"], action, round(amt, 2), round(bal, 2)])
 
-    return full_text, rows, sections
+    return full_text, rows, sections, actions_by_day
 
 
 # ---------- GUI ----------
@@ -764,12 +774,14 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("%s v%s" % (APP_NAME, VERSION))
-        self.geometry("960x780")
-        self.minsize(880, 700)
+        self.geometry("960x880")
+        self.minsize(880, 800)
         self.configure(padx=10, pady=8)
         self.rows = []
         self.small_counter = 0
         self.last_rows = None
+        self.pending_plan = None   # 最近生成、尚未确认采用的方案快照
+        self.adopted_plan = None   # 已确认采用的方案（持久化，主页面每日展示）
         self.today_done_var = tk.BooleanVar(value=False)  # 今天是否已全部操作过
         self.pack_today_var = tk.BooleanVar(value=False)  # 起始日是否打包
         self.save_status_var = tk.StringVar(value="")
@@ -779,6 +791,11 @@ class App(tk.Tk):
         self._build_style()
         self._build_ui()
         self._auto_load()   # 启动自动恢复上次配置（无则用默认）
+        # 今日执行面板：每 30 秒与窗口重新获得焦点时按系统日期自动刷新
+        self._today_key = datetime.date.today().isoformat()
+        self._refresh_today_panel()
+        self.after(30000, self._tick_today)
+        self.bind("<FocusIn>", lambda e: self._tick_today(check_only=True))
         # 关闭窗口时自动保存，用户无需手动点
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         # 每次启动后台静默检查更新（不打断使用）
@@ -853,6 +870,15 @@ class App(tk.Tk):
         ttk.Label(self, textvariable=self.rest_var, foreground="#c60",
                   font=("Microsoft YaHei", 10)).pack(anchor="w", pady=(0, 6))
 
+        # 今日执行面板：确认采用方案后，每天自动显示各号该做什么
+        self.today_frame = ttk.LabelFrame(self, text=" 今日执行（每天自动更新） ", padding=6)
+        self.today_frame.pack(fill="x", pady=(0, 6))
+        self.today_date_var = tk.StringVar()
+        ttk.Label(self.today_frame, textvariable=self.today_date_var,
+                  font=("Microsoft YaHei", 10, "bold"), foreground="#066").pack(anchor="w")
+        self.today_lines = ttk.Frame(self.today_frame)
+        self.today_lines.pack(fill="x", pady=(2, 0))
+
         # 起始状态开关区
         sw = ttk.LabelFrame(self, text=" 执行状态（生成方案前先确认） ", padding=6)
         sw.pack(fill="x", pady=(0, 6))
@@ -899,9 +925,9 @@ class App(tk.Tk):
         ttk.Label(op, textvariable=self.save_status_var, foreground="#0a6").pack(side="left", padx=6)
 
         # 方案不在主窗口拆分：生成后在独立窗口以单一页面完整展示
-        tip = ttk.LabelFrame(self, text=" 方案 ", padding=8)
-        tip.pack(fill="x")
-        ttk.Label(tip,
+        self.plan_tip = ttk.LabelFrame(self, text=" 方案 ", padding=8)
+        self.plan_tip.pack(fill="x")
+        ttk.Label(self.plan_tip,
                   text="点「生成方案」后，完整方案会在独立窗口的单一页面显示；可复制全文、导出 CSV。",
                   foreground="#666").pack(anchor="w")
 
@@ -922,6 +948,57 @@ class App(tk.Tk):
         # 规划天数同步显示
         if hasattr(self, "param_vars") and "plan_days" in self.param_vars:
             self.param_vars["plan_days"].set(str(c["plan_days"]))
+
+    # ---- 今日执行面板：按系统日期每天自动更新 ----
+    def _tick_today(self, check_only=False):
+        key = datetime.date.today().isoformat()
+        if key != getattr(self, "_today_key", None):
+            self._today_key = key
+            self._refresh_today_panel()
+        if not check_only:
+            self.after(30000, self._tick_today)
+
+    def _refresh_today_panel(self):
+        if not hasattr(self, "today_lines"):
+            return
+        for c in list(self.today_lines.winfo_children()):
+            c.destroy()
+        plan = getattr(self, "adopted_plan", None)
+        now = datetime.date.today()
+        if not plan:
+            self.today_date_var.set("尚未采用方案")
+            ttk.Label(self.today_lines,
+                      text="生成方案后点「确认采用此方案」，这里会每天自动显示各号该做什么。",
+                      foreground="#888").pack(anchor="w")
+            return
+        try:
+            pstart = datetime.date(int(plan["year"]), int(plan["month"]), int(plan["start_day"]))
+            pend = datetime.date(int(plan["year"]), int(plan["month"]), int(plan["end_day"]))
+            actions = plan.get("actions", {})
+        except Exception:
+            self.today_date_var.set("采用的方案数据异常")
+            ttk.Label(self.today_lines, text="请重新生成方案并点「确认采用此方案」。",
+                      foreground="#c60").pack(anchor="w")
+            return
+        self.today_date_var.set("今天是 %d年%d月%d日 %s ｜ 按已采用方案执行" %
+                                (now.year, now.month, now.day, WEEK_CN[now.weekday()]))
+        if now < pstart:
+            ttk.Label(self.today_lines,
+                      text="今天不用操作，采用的方案从 %d月%d日 开始。" % (pstart.month, pstart.day),
+                      foreground="#666").pack(anchor="w")
+            return
+        if now > pend:
+            ttk.Label(self.today_lines,
+                      text="方案已到 %d月%d日 结束，请重新生成并采用新方案。" % (pend.month, pend.day),
+                      foreground="#c60").pack(anchor="w")
+            return
+        day_actions = actions.get(str(now.day), {})
+        if not day_actions:
+            ttk.Label(self.today_lines, text="今日无安排（休息日）。", foreground="#666").pack(anchor="w")
+            return
+        for note, acts in day_actions.items():
+            txt = "· %s：%s" % (note, "、".join(acts) if acts else "静默（不登录、不操作）")
+            ttk.Label(self.today_lines, text=txt).pack(anchor="w")
 
     # ---- 字段改动即时保存（防抖）----
     def _schedule_save(self, *args):
@@ -996,6 +1073,7 @@ class App(tk.Tk):
             r.frame.destroy()
         self.rows = []
         self.small_counter = 0
+        self.adopted_plan = None   # 重置账号=放弃已采用方案，避免主页面显示旧安排
         self.add_row("big", 0, "大号", 0, 0)
         for i in range(3):
             self.add_small()
@@ -1025,9 +1103,15 @@ class App(tk.Tk):
     def on_generate(self):
         try:
             accounts, p = self.collect()
-            text, rows, _sections = build_plan(accounts, p, self.ctx,
-                                               pack_on_start=self.pack_today_var.get())
+            text, rows, _sections, actions = build_plan(
+                accounts, p, self.ctx, pack_on_start=self.pack_today_var.get())
             self.last_rows = rows
+            c = self.ctx
+            self.pending_plan = {
+                "year": c["year"], "month": c["month"],
+                "start_day": c["start_day"], "end_day": c["days_in_month"],
+                "actions": {str(d): dict(v) for d, v in actions.items()},
+            }
             self._auto_save()  # 生成时顺手保存，改动即时落盘
             self._show_plan(text)  # 方案在独立窗口以单一页面完整展示
         except Exception as e:
@@ -1035,6 +1119,8 @@ class App(tk.Tk):
 
     # ---- 方案独立页面：一页看完整方案，不拆分页签 ----
     def _show_plan(self, text):
+        if hasattr(self, "plan_tip") and not self.plan_tip.winfo_ismapped():
+            self.plan_tip.pack(fill="x")
         win = getattr(self, "plan_win", None)
         if win is not None and win.winfo_exists():
             # 已打开则刷新同一个窗口，避免堆一堆窗口
@@ -1044,7 +1130,7 @@ class App(tk.Tk):
             txt.insert("1.0", text)
             txt.configure(state="disabled")
             txt.yview_moveto(0)
-            self.plan_status_var.set("方案生成时间：%s ｜ 向下滚动查看完整内容" %
+            self.plan_status_var.set("方案生成时间：%s ｜ 确认采用后主页面每日显示各号操作" %
                                      datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
             win.lift()
             win.focus_set()
@@ -1063,6 +1149,7 @@ class App(tk.Tk):
         ttk.Button(bar, text="关闭", command=self._close_plan).pack(side="right", padx=3)
         ttk.Button(bar, text="复制全文", command=self._copy_plan).pack(side="right", padx=3)
         ttk.Button(bar, text="导出明细CSV", command=self.on_export).pack(side="right", padx=3)
+        ttk.Button(bar, text="确认采用此方案", command=self._adopt_plan).pack(side="right", padx=3)
 
         body = ttk.Frame(win, padding=(10, 0, 10, 10))
         body.pack(fill="both", expand=True)
@@ -1072,10 +1159,25 @@ class App(tk.Tk):
         txt.insert("1.0", text)
         txt.configure(state="disabled")  # 只读，防止误改方案
         self.plan_text = txt
-        self.plan_status_var.set("方案生成时间：%s ｜ 向下滚动查看完整内容" %
+        self.plan_status_var.set("方案生成时间：%s ｜ 确认采用后主页面每日显示各号操作" %
                                  datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
         win.protocol("WM_DELETE_WINDOW", self._close_plan)
         win.after(80, lambda: (win.lift(), win.focus_set()))
+
+    def _adopt_plan(self):
+        """确认采用当前生成的方案：持久化快照，主页面从此每天自动显示各号操作。"""
+        plan = getattr(self, "pending_plan", None)
+        if not plan:
+            messagebox.showwarning("提示", "请先生成方案。", parent=self.plan_win)
+            return
+        self.adopted_plan = dict(plan)
+        self.adopted_plan["adopted_at"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+        self._auto_save()
+        self.plan_tip.pack_forget()   # 采用后不再需要生成引导，留出今日执行空间
+        self._refresh_today_panel()
+        self._close_plan()
+        messagebox.showinfo("已采用", "方案已采用。主页面会每天自动显示当天各号该做什么。",
+                            parent=self)
 
     def _close_plan(self):
         win = getattr(self, "plan_win", None)
@@ -1152,6 +1254,7 @@ class App(tk.Tk):
         data["params"] = p
         data["today_done"] = bool(self.today_done_var.get())
         data["pack_today"] = bool(self.pack_today_var.get())
+        data["adopted_plan"] = getattr(self, "adopted_plan", None)
         try:
             with open(self.config_path(), "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
@@ -1226,6 +1329,7 @@ class App(tk.Tk):
                     pass
         if data and data.get("accounts"):
             self._apply_data(data)
+            self.adopted_plan = data.get("adopted_plan")
             try:
                 self.save_status_var.set("✓ 已自动恢复上次填写的数据")
             except Exception:

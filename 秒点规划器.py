@@ -23,7 +23,7 @@ import datetime
 import calendar
 
 APP_NAME = "秒点规划器"
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 APP_VERSION = VERSION   # 版本更新模块使用
 
 # ===== 内置「版本更新」配置 =====
@@ -527,9 +527,8 @@ def simulate_big(ac, p, income_by_day, start_day=1, rest_days=None, pack_on_star
 
 
 def build_plan(accounts, p, ctx=None, pack_on_start=False):
-    """生成 (文本方案, csv行列表)。accounts: list of dict(role,note,balance,login_claimed)
-    ctx: month_context() 返回的日期上下文；不传则按今天实时获取。
-    pack_on_start: 用户勾选「起始日打包」→ 起始日打包一次并扣点。
+    """生成 (完整文本, csv行列表, 分板块列表)。
+    分板块列表: [(页签名, 文本), ...]，供 GUI 分页展示。
     """
     ctx = ctx or month_context()
     start_day = ctx["start_day"]
@@ -557,39 +556,38 @@ def build_plan(accounts, p, ctx=None, pack_on_start=False):
     packs, bev, bend, big_login_used, packable_days = simulate_big(
         big, p, income_by_day, start_day, rest_days, pack_on_start)
 
-    # ---- 文本方案 ----
-    L = []
-    L.append("=" * 58)
-    L.append("%s 方案（%d月%d日 %s 起，至%d月末共 %d 天）" %
-             (APP_NAME, ctx["month"], ctx["start_day"], ctx["weekday"],
-              ctx["month"], ctx["plan_days"]))
+    # ---- 文本方案：分板块构建，便于 GUI 分页展示 ----
+    sec_overview, sec_today, sec_daily, sec_copy, sec_big = [], [], [], [], []
+
+    # 板块1：总览与规则
+    sec_overview.append("%s 方案（%d月%d日 %s 起，至%d月末共 %d 天）" %
+                        (APP_NAME, ctx["month"], ctx["start_day"], ctx["weekday"],
+                         ctx["month"], ctx["plan_days"]))
     if ctx.get("today_done"):
-        L.append("※ 你已勾选「今天(%d月%d日)全部操作过」，本方案从明天开始排。" %
-                 (ctx["today_month"], ctx["today"]))
-    L.append("=" * 58)
+        sec_overview.append("※ 你已勾选「今天(%d月%d日)全部操作过」，本方案从明天开始排。" %
+                            (ctx["today_month"], ctx["today"]))
     per = p["work_price"] * (1 - p["copy_fee_pct"] / 100.0)
-    L.append("规则：作品定价 %d 点，手续费 %d%% → 大号每得 %g 点/次" %
-             (p["work_price"], p["copy_fee_pct"], per))
-    L.append("      点赞 +%d/天（%d次×%d点）；登录前 %d 天 +%d/天；有效期 %d 天" %
-             (p["like_gain"] * p["like_per_day"], p["like_per_day"], p["like_gain"],
-              p["login_days_cap"], p["login_bonus"], p["expiry_days"]))
-    L.append("      后端 %d 项×%d = %d/天；打包 %d 点/次" %
-             (p["backend_projects"], p["backend_per_day"],
-              p["backend_projects"] * p["backend_per_day"], p["pack_cost"]))
+    sec_overview.append("规则：作品定价 %d 点，手续费 %d%% → 大号每得 %g 点/次" %
+                        (p["work_price"], p["copy_fee_pct"], per))
+    sec_overview.append("      点赞 +%d/天（%d次×%d点）；登录前 %d 天 +%d/天；有效期 %d 天" %
+                        (p["like_gain"] * p["like_per_day"], p["like_per_day"], p["like_gain"],
+                         p["login_days_cap"], p["login_bonus"], p["expiry_days"]))
+    sec_overview.append("      后端 %d 项×%d = %d/天；打包 %d 点/次" %
+                        (p["backend_projects"], p["backend_per_day"],
+                         p["backend_projects"] * p["backend_per_day"], p["pack_cost"]))
     if rest_days:
         rest_txt = "、".join("%d日" % d for d in sorted(rest_days))
-        L.append("      ★ 周日（%s）为休息日：全天无点赞/登录/复制/打包收入，后端照常扣费。" % rest_txt)
-    L.append("")
+        sec_overview.append("★ 周日（%s）为休息日：全天无点赞/登录/复制/打包收入，后端照常扣费。" % rest_txt)
 
-    # ===== 每日逐号行动表（每个号每天做什么，一眼看清）=====
+    # 板块2：首日各号该做什么
     day_label = "明天" if ctx.get("today_done") else "今天"
-    L.append("【%s（%d月%d日 %s）各号该做什么】" %
-             (day_label, ctx["month"], ctx["start_day"], ctx["weekday"]))
+    sec_today.append("【%s（%d月%d日 %s）各号该做什么】" %
+                     (day_label, ctx["month"], ctx["start_day"], ctx["weekday"]))
     notes = [ac["note"] for ac in smalls] + [big["note"]]
     if start_day in rest_days:
-        L.append("  ★ 起始日是周日：所有号都不登录、不点赞、不复制、不打包，全部静默；")
-        L.append("    只有大号后端照扣 %d 点。等周一再恢复操作。" %
-                 (p["backend_projects"] * p["backend_per_day"]))
+        sec_today.append("  ★ 起始日是周日：所有号都不登录、不点赞、不复制、不打包，全部静默；")
+        sec_today.append("    只有大号后端照扣 %d 点。等周一再恢复操作。" %
+                         (p["backend_projects"] * p["backend_per_day"]))
     else:
         for ac, copies, ev, ai, eb, lu in small_results:
             login_left = max(0, p["login_days_cap"] - int(ac.get("login_claimed", 0)))
@@ -599,20 +597,18 @@ def build_plan(accounts, p, ctx=None, pack_on_start=False):
                 cp = "，复制：" + "、".join("作品%d" % w for w in today_copies)
             else:
                 cp = "（余额不足，先攒点）"
-            L.append("  · %s：%s%d 次%s" %
-                     (ac["note"], login_txt, p["like_per_day"], cp))
+            sec_today.append("  · %s：%s%d 次%s" %
+                             (ac["note"], login_txt, p["like_per_day"], cp))
         big_login_left = max(0, p["login_days_cap"] - int(big.get("login_claimed", 0)))
         big_login_txt = "登录领奖+点赞" if big_login_left > 0 else "点赞(已领满登录)"
         pack_today = "；【按你勾选】今天打包一次 -%d 点" % p["pack_cost"] if (
             pack_on_start and packs) else "；今天不打包"
-        L.append("  · %s：%s%d 次（后端今天照扣 %d 点）%s" %
-                 (big["note"], big_login_txt, p["like_per_day"],
-                  p["backend_projects"] * p["backend_per_day"], pack_today))
-    L.append("")
+        sec_today.append("  · %s：%s%d 次（后端今天照扣 %d 点）%s" %
+                         (big["note"], big_login_txt, p["like_per_day"],
+                          p["backend_projects"] * p["backend_per_day"], pack_today))
 
-    # ===== 逐日行动预览：每天每个号做什么（直接取模拟事件，准确）=====
-    L.append("【逐日行动预览】每个号每天具体做什么，照着做即可")
-    # 把每个号的 events 归到 天→备注→[动作]
+    # 板块3：逐日行动预览
+    sec_daily.append("每个号每天具体做什么，照着做即可")
     actions_by_day = {}   # day -> {note: [动作文本]}
     def _short_action(a):
         if "登录领奖+点赞" in a:
@@ -644,65 +640,77 @@ def build_plan(accounts, p, ctx=None, pack_on_start=False):
     for d in range(start_day, start_day + p["plan_days"]):
         week = WEEK_CN[datetime.date(ctx["year"], ctx["month"], d).weekday()]
         tag = "  ★周日休息日" if d in rest_days else ""
-        L.append("  ── %d日(%s)%s" % (d, week, tag))
+        sec_daily.append("  ── %d日(%s)%s" % (d, week, tag))
         for note in notes:
             acts = actions_by_day.get(d, {}).get(note, [])
-            L.append("      %s：%s" % (note, "、".join(acts) if acts else "静默"))
-    L.append("")
+            sec_daily.append("      %s：%s" % (note, "、".join(acts) if acts else "静默"))
 
-    # 小号排期
+    # 板块4：小号复制排期
     for ac, copies, ev, ai, eb, lu in small_results:
-        L.append("-" * 58)
-        L.append("【%s】当前 %g 点｜本月已领登录 %d 天（方案内再领 %d 天）" %
-                 (ac["note"], ac["balance"], int(ac.get("login_claimed", 0)), lu))
-        L.append("  复制 %d 次 → 为大号贡献 %g 点；月末余额约 %g 点" %
-                 (len(copies), ai, eb))
+        sec_copy.append("【%s】当前 %g 点｜本月已领登录 %d 天（方案内再领 %d 天）" %
+                        (ac["note"], ac["balance"], int(ac.get("login_claimed", 0)), lu))
+        sec_copy.append("  复制 %d 次 → 为大号贡献 %g 点；月末余额约 %g 点" %
+                        (len(copies), ai, eb))
         if copies:
             txt = "  "
             for i, (d, wi) in enumerate(copies):
                 txt += "%d日→作品%d  " % (d, wi)
                 if (i + 1) % 5 == 0:
-                    L.append(txt)
+                    sec_copy.append(txt)
                     txt = "  "
             if txt.strip():
-                L.append(txt)
-            L.append("  （作品按 1→2→3→4 轮换，同一账号不会连续复制同一个作品）")
+                sec_copy.append(txt)
+            sec_copy.append("  （作品按 1→2→3→4 轮换，同一账号不会连续复制同一个作品）")
         else:
-            L.append("  当前余额不足定价 %d，需先攒点。" % p["work_price"])
-        L.append("")
+            sec_copy.append("  当前余额不足定价 %d，需先攒点。" % p["work_price"])
+        sec_copy.append("")
 
-    # 大号排期
-    L.append("-" * 58)
+    # 板块5：大号与打包 + 汇总
     total_ai = sum(r[3] for r in small_results)
     total_copies = sum(len(r[1]) for r in small_results)
-    L.append("【%s】当前 %g 点｜本月已领登录 %d 天（方案内再领 %d 天）" %
-             (big["note"], big["balance"], int(big.get("login_claimed", 0)), big_login_used))
-    L.append("  小号合计复制 %d 次 → 转账收入 %g 点" % (total_copies, total_ai))
-    L.append("  后端每天 -%d，%d 天共 -%d" %
-             (p["backend_projects"] * p["backend_per_day"], p["plan_days"],
-              p["backend_projects"] * p["backend_per_day"] * p["plan_days"]))
+    sec_big.append("【%s】当前 %g 点｜本月已领登录 %d 天（方案内再领 %d 天）" %
+                   (big["note"], big["balance"], int(big.get("login_claimed", 0)), big_login_used))
+    sec_big.append("  小号合计复制 %d 次 → 转账收入 %g 点" % (total_copies, total_ai))
+    sec_big.append("  后端每天 -%d，%d 天共 -%d" %
+                   (p["backend_projects"] * p["backend_per_day"], p["plan_days"],
+                    p["backend_projects"] * p["backend_per_day"] * p["plan_days"]))
     if packs:
-        L.append("  打包：按你的勾选，在 %s 打包 1 次，扣 %d 点。" %
-                 ("、".join("%d日" % d for d in packs), p["pack_cost"]))
+        sec_big.append("  打包：按你的勾选，在 %s 打包 1 次，扣 %d 点。" %
+                       ("、".join("%d日" % d for d in packs), p["pack_cost"]))
     else:
-        L.append("  本次未安排打包（平时不打包，余额自然累积/过期）。")
+        sec_big.append("  本次未安排打包（平时不打包，余额自然累积/过期）。")
     if packable_days:
-        # 只提示第一段连续可打包区间的起始日
-        L.append("  可打包时机：%d日 起余额达到 %d 点，届时你可自行决定要不要打包（软件不自动扣）。" %
-                 (packable_days[0], p["pack_cost"]))
+        sec_big.append("  可打包时机：%d日 起余额达到 %d 点，届时你可自行决定要不要打包（软件不自动扣）。" %
+                       (packable_days[0], p["pack_cost"]))
     else:
-        L.append("  规划期内余额未再达到打包线 %d。" % p["pack_cost"])
-    L.append("  月末预计余额约 %g 点" % bend)
-    L.append("")
-    L.append("=" * 58)
-    L.append("【汇总】小号复制 %d 次｜大号打包 %d 次｜大号月末余额约 %g 点" %
-             (total_copies, len(packs), bend))
+        sec_big.append("  规划期内余额未再达到打包线 %d。" % p["pack_cost"])
+    sec_big.append("  月末预计余额约 %g 点" % bend)
+    sec_big.append("")
+    sec_big.append("【汇总】小号复制 %d 次｜大号打包 %d 次｜大号月末余额约 %g 点" %
+                   (total_copies, len(packs), bend))
     if p["work_count"] < 2:
-        L.append("提示：作品数量建议≥2，否则同一账号可能连续复制同一作品。")
-    L.append("说明：方案按真实日历日排布（%d月%d日～%d日）；当前余额按起始日可用计入并从起始日起算有效期；" %
-             (ctx["month"], ctx["start_day"], ctx["days_in_month"]))
-    L.append("      余额请填「调整好作品之后」的实际数（调整消耗的秒点已含在内，软件不再另扣）。")
-    L.append("      打包平时不自动做；要打包就在界面勾选，生成时只扣那一次。改了余额记得重新生成。")
+        sec_big.append("提示：作品数量建议≥2，否则同一账号可能连续复制同一作品。")
+    sec_big.append("说明：方案按真实日历日排布（%d月%d日～%d日）；当前余额按起始日可用计入并从起始日起算有效期；" %
+                   (ctx["month"], ctx["start_day"], ctx["days_in_month"]))
+    sec_big.append("      余额请填「调整好作品之后」的实际数（调整消耗的秒点已含在内，软件不再另扣）。")
+    sec_big.append("      打包平时不自动做；要打包就在界面勾选，生成时只扣那一次。改了余额记得重新生成。")
+
+    # 完整文本（兼容导出/外部调用）
+    L = []
+    L.append("=" * 58); L += sec_overview; L.append(""); L.append("=" * 58)
+    L += sec_today; L.append("")
+    L.append("【逐日行动预览】"); L += sec_daily; L.append("")
+    L += sec_copy
+    L.append("-" * 58); L += sec_big
+    full_text = "\n".join(L)
+
+    sections = [
+        ("今日行动", "\n".join(sec_overview) + "\n\n" + "\n".join(sec_today)),
+        ("逐日行动", "\n".join(sec_daily)),
+        ("复制排期", "\n".join(sec_copy)),
+        ("大号与打包", "\n".join(sec_big)),
+        ("全部", full_text),
+    ]
 
     # ---- CSV 明细 ----
     rows = [["日期(号)", "账号", "备注", "动作", "变动(点)", "操作后余额"]]
@@ -712,7 +720,7 @@ def build_plan(accounts, p, ctx=None, pack_on_start=False):
     for d, action, amt, bal in bev:
         rows.append([d, "大号", big["note"], action, round(amt, 2), round(bal, 2)])
 
-    return "\n".join(L), rows
+    return full_text, rows, sections
 
 
 # ---------- GUI ----------
@@ -758,6 +766,9 @@ class App(tk.Tk):
         self.last_rows = None
         self.today_done_var = tk.BooleanVar(value=False)  # 今天是否已全部操作过
         self.pack_today_var = tk.BooleanVar(value=False)  # 起始日是否打包
+        self.save_status_var = tk.StringVar(value="")
+        self._save_job = None          # 防抖定时器
+        self._binding_saves = False    # 灌数据期间暂不触发 trace 保存
         self.ctx = month_context(today_done=False)
         self._build_style()
         self._build_ui()
@@ -842,7 +853,7 @@ class App(tk.Tk):
         ttk.Checkbutton(sw, text="今天各号已全部操作过（勾选→方案从明天排起）",
                         variable=self.today_done_var,
                         command=self._on_switch_changed).pack(anchor="w")
-        ttk.Checkbutton(sw, text="起始日要打包作品（勾选→方案第一天打包一次并扣点；平时不打包）",
+        ttk.Checkbutton(sw, text="今天我要打包（勾选→方案第一天打包一次并扣点；平时不打包）",
                         variable=self.pack_today_var,
                         command=self._on_switch_changed).pack(anchor="w")
 
@@ -869,6 +880,8 @@ class App(tk.Tk):
             ent = ttk.Entry(cell, textvariable=v, width=7)
             if key == "plan_days":
                 ent.configure(state="readonly")  # 规划天数自动取当月，禁止手改
+            else:
+                v.trace_add("write", self._schedule_save)  # 参数改动也即时保存
             ent.pack(side="left")
             self.param_vars[key] = v
 
@@ -877,14 +890,22 @@ class App(tk.Tk):
         op.pack(fill="x", pady=10)
         ttk.Button(op, text="生成方案", command=self.on_generate).pack(side="left")
         ttk.Button(op, text="导出明细CSV", command=self.on_export).pack(side="left", padx=6)
-        ttk.Label(op, text="（配置每次改动后自动保存，下次打开自动恢复，无需手动存取）",
-                  foreground="#888").pack(side="left", padx=6)
+        ttk.Label(op, textvariable=self.save_status_var, foreground="#0a6").pack(side="left", padx=6)
 
-        # 输出区
-        out_box = ttk.LabelFrame(self, text=" 方案输出 ", padding=6)
+        # 输出区：多页签，按板块分开，查看更清楚
+        out_box = ttk.LabelFrame(self, text=" 方案输出（点页签切换查看） ", padding=6)
         out_box.pack(fill="both", expand=True)
-        self.out = scrolledtext.ScrolledText(out_box, wrap="word", font=("Microsoft YaHei", 10))
-        self.out.pack(fill="both", expand=True)
+        self.notebook = ttk.Notebook(out_box)
+        self.notebook.pack(fill="both", expand=True)
+        self.tab_texts = {}
+        for name in ("今日行动", "逐日行动", "复制排期", "大号与打包", "全部"):
+            tab = ttk.Frame(self.notebook)
+            txt = scrolledtext.ScrolledText(tab, wrap="word", font=("Microsoft YaHei", 10),
+                                            padx=8, pady=6)
+            txt.pack(fill="both", expand=True)
+            self.notebook.add(tab, text=name)
+            self.tab_texts[name] = txt
+        self.out = self.tab_texts["全部"]  # 兼容导出/外部引用
 
     # ---- 日期栏刷新 ----
     def _refresh_date_bar(self):
@@ -904,9 +925,37 @@ class App(tk.Tk):
         if hasattr(self, "param_vars") and "plan_days" in self.param_vars:
             self.param_vars["plan_days"].set(str(c["plan_days"]))
 
+    # ---- 字段改动即时保存（防抖）----
+    def _schedule_save(self, *args):
+        """任一输入变化后 0.6 秒自动保存；灌配置期间跳过。"""
+        if getattr(self, "_binding_saves", False):
+            return
+        if self._save_job:
+            try:
+                self.after_cancel(self._save_job)
+            except Exception:
+                pass
+        self._save_job = self.after(600, self._do_scheduled_save)
+
+    def _do_scheduled_save(self):
+        self._save_job = None
+        self._auto_save()
+        try:
+            self.save_status_var.set("✓ 已自动保存（下次打开自动恢复）")
+        except Exception:
+            pass
+
+    def _bind_row_saves(self, row):
+        for var in (row.note_var, row.bal_var, row.login_var):
+            var.trace_add("write", self._schedule_save)
+
     def _on_switch_changed(self):
         self._refresh_date_bar()
         self._auto_save()
+        try:
+            self.save_status_var.set("✓ 已自动保存")
+        except Exception:
+            pass
 
     # ---- 账号行管理 ----
     def add_row(self, role, idx, note, balance, login_claimed):
@@ -919,6 +968,7 @@ class App(tk.Tk):
             for w in row.frame.winfo_children():
                 pass
         self.rows.append(row)
+        self._bind_row_saves(row)
         return row
 
     def add_small(self):
@@ -928,13 +978,22 @@ class App(tk.Tk):
         btn = row.frame.grid_slaves(row=0, column=7)
         if btn:
             btn[0].configure(command=lambda rr=row: self.delete_row(rr))
+        self._schedule_save()
 
     def delete_row(self, row):
         if row in self.rows:
             self.rows.remove(row)
             row.frame.destroy()
+            self._schedule_save()
 
     def _load_defaults(self):
+        self._binding_saves = True
+        try:
+            self._load_defaults_inner()
+        finally:
+            self._binding_saves = False
+
+    def _load_defaults_inner(self):
         for r in list(self.rows):
             r.frame.destroy()
         self.rows = []
@@ -968,11 +1027,14 @@ class App(tk.Tk):
     def on_generate(self):
         try:
             accounts, p = self.collect()
-            text, rows = build_plan(accounts, p, self.ctx,
-                                    pack_on_start=self.pack_today_var.get())
+            text, rows, sections = build_plan(accounts, p, self.ctx,
+                                              pack_on_start=self.pack_today_var.get())
             self.last_rows = rows
-            self.out.delete("1.0", "end")
-            self.out.insert("1.0", text)
+            for name, content in sections:
+                if name in self.tab_texts:
+                    w = self.tab_texts[name]
+                    w.delete("1.0", "end")
+                    w.insert("1.0", content)
             self._auto_save()  # 生成时顺手保存，改动即时落盘
         except Exception as e:
             messagebox.showerror("无法生成方案", str(e))
@@ -994,23 +1056,62 @@ class App(tk.Tk):
             messagebox.showerror("导出失败", str(e))
 
     def config_path(self):
+        """配置统一放在「用户目录」，exe 换位置/更新后仍能读到同一份，不被覆盖丢失。"""
+        base = os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Local")
+        folder = os.path.join(base, APP_NAME)
+        try:
+            os.makedirs(folder, exist_ok=True)
+        except Exception:
+            pass
+        return os.path.join(folder, "秒点规划器配置.json")
+
+    def _legacy_config_path(self):
+        """旧版配置位置：exe 同目录。仅用于一次性迁移。"""
         return os.path.join(_app_dir(), "秒点规划器配置.json")
 
     # ---- 配置：开机自动恢复 + 自动保存（无需手动点）----
     def _auto_save(self):
-        """静默保存当前账号与参数，不弹窗、不打断。"""
+        """账号与参数分别容错保存：某一项输入非法也不影响其他项落盘。"""
+        data = {"version": VERSION}
+        # 账号：逐行容错
+        accounts = []
+        for r in self.rows:
+            try:
+                accounts.append(r.to_dict())
+            except Exception:
+                pass
+        data["accounts"] = accounts
+        # 参数：逐项容错，跳过非法输入
+        p = {}
+        for k, _ in PARAM_LABELS:
+            try:
+                raw = self.param_vars[k].get().strip()
+                val = float(raw)
+                p[k] = int(val) if val == int(val) else val
+            except Exception:
+                pass
+        data["params"] = p
+        data["today_done"] = bool(self.today_done_var.get())
+        data["pack_today"] = bool(self.pack_today_var.get())
         try:
-            accounts, p = self.collect()
-            data = {"version": VERSION, "accounts": accounts, "params": p,
-                    "today_done": self.today_done_var.get(),
-                    "pack_today": self.pack_today_var.get()}
             with open(self.config_path(), "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass  # 自动保存失败不打扰用户
+        except Exception as e:
+            # 保存到状态栏给出可见提示，不再静默失败
+            try:
+                self.save_status_var.set("⚠ 配置保存失败：%s" % str(e)[:40])
+            except Exception:
+                pass
 
     def _apply_data(self, data):
         """把配置数据灌回界面（供自动恢复与手动重置共用）。"""
+        self._binding_saves = True
+        try:
+            self._apply_data_inner(data)
+        finally:
+            self._binding_saves = False
+
+    def _apply_data_inner(self, data):
         for r in list(self.rows):
             r.frame.destroy()
         self.rows = []
@@ -1041,18 +1142,37 @@ class App(tk.Tk):
         self._refresh_date_bar()
 
     def _auto_load(self):
-        """启动时静默读取上次配置；没有或损坏则用默认值。"""
+        """启动时读取上次配置；兼容旧 exe 目录配置并迁到用户目录；无则用默认值。"""
         path = self.config_path()
+        data = None
         if os.path.exists(path):
             try:
                 with open(path, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                if data.get("accounts"):
-                    self._apply_data(data)
-                    return
+            except Exception:
+                data = None
+        # 若用户目录没有，尝试从旧 exe 目录读取并迁移（换位置/更新后数据不丢）
+        if not data or not data.get("accounts"):
+            old = self._legacy_config_path()
+            if os.path.exists(old):
+                try:
+                    with open(old, "r", encoding="utf-8") as f:
+                        old_data = json.load(f)
+                    if old_data.get("accounts"):
+                        data = old_data
+                        # 直接把旧配置落到新路径（不要经过界面，避免写入默认值）
+                        with open(path, "w", encoding="utf-8") as nf:
+                            json.dump(old_data, nf, ensure_ascii=False, indent=2)
+                except Exception:
+                    pass
+        if data and data.get("accounts"):
+            self._apply_data(data)
+            try:
+                self.save_status_var.set("✓ 已自动恢复上次填写的数据")
             except Exception:
                 pass
-        self._load_defaults()
+        else:
+            self._load_defaults()
 
     # ===== 内置版本更新：检查 / 横幅 / 下载 / 安装 / 重启 =====
     def _check_update(self, manual=False):
@@ -1206,6 +1326,13 @@ class App(tk.Tk):
         self.update_status.config(text="已恢复默认更新地址", fg="#aab7c4")
 
     def _on_close(self):
+        # 取消尚未触发的防抖保存，避免销毁后回调报错
+        if getattr(self, "_save_job", None):
+            try:
+                self.after_cancel(self._save_job)
+            except Exception:
+                pass
+            self._save_job = None
         self._auto_save()
         self.destroy()
 

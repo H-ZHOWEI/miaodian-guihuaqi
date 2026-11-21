@@ -23,7 +23,7 @@ import datetime
 import calendar
 
 APP_NAME = "秒点规划器"
-VERSION = "1.6.0"
+VERSION = "1.6.1"
 APP_VERSION = VERSION   # 版本更新模块使用
 
 # ===== 内置「版本更新」配置 =====
@@ -87,17 +87,23 @@ def save_update_config(cfg):
         pass
 
 
-def _mirror_urls(primary):
+def _mirror_urls(primary, nocache=True):
     """清单/下载地址 -> 多镜像列表（直链 + 代理镜像）。不使用 jsDelivr。"""
-    urls = [primary]
+    def stamp(u):
+        if not nocache:
+            return u
+        sep = "&" if "?" in u else "?"
+        return u + sep + "_t=" + str(int(time.time() * 1000))
+
+    urls = [stamp(primary)]
     for p in _EXE_MIRROR_PREFIX:
-        urls.append(p.rstrip("/") + "/" + primary)
+        urls.append(stamp(p.rstrip("/") + "/" + primary))
     if "raw.githubusercontent.com" in primary:
         alt = primary.replace("raw.githubusercontent.com", "github.com", 1)
         alt = re.sub(r"github\.com/([^/]+)/([^/]+)/main/",
                      r"github.com/\1/\2/raw/main/", alt, count=1)
         if alt != primary:
-            urls.append(alt)
+            urls.append(stamp(alt))
     return urls
 
 

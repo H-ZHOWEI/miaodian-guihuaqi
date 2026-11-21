@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-秒点规划器 v1.0.0
+秒点规划器 v1.7.0
 根据每个账号当前秒点余额，模拟并生成「点赞 / 登录领奖 / 复制转账 / 打包」的执行方案。
 用 Python 3.12 + tkinter，可打包为单文件 exe。
 """
@@ -23,7 +23,7 @@ import datetime
 import calendar
 
 APP_NAME = "秒点规划器"
-VERSION = "1.6.1"
+VERSION = "1.7.0"
 APP_VERSION = VERSION   # 版本更新模块使用
 
 # ===== 内置「版本更新」配置 =====
@@ -764,8 +764,8 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("%s v%s" % (APP_NAME, VERSION))
-        self.geometry("960x760")
-        self.minsize(880, 680)
+        self.geometry("960x640")
+        self.minsize(880, 560)
         self.configure(padx=10, pady=8)
         self.rows = []
         self.small_counter = 0
@@ -898,20 +898,12 @@ class App(tk.Tk):
         ttk.Button(op, text="导出明细CSV", command=self.on_export).pack(side="left", padx=6)
         ttk.Label(op, textvariable=self.save_status_var, foreground="#0a6").pack(side="left", padx=6)
 
-        # 输出区：多页签，按板块分开，查看更清楚
-        out_box = ttk.LabelFrame(self, text=" 方案输出（点页签切换查看） ", padding=6)
-        out_box.pack(fill="both", expand=True)
-        self.notebook = ttk.Notebook(out_box)
-        self.notebook.pack(fill="both", expand=True)
-        self.tab_texts = {}
-        for name in ("今日行动", "逐日行动", "复制排期", "大号与打包", "全部"):
-            tab = ttk.Frame(self.notebook)
-            txt = scrolledtext.ScrolledText(tab, wrap="word", font=("Microsoft YaHei", 10),
-                                            padx=8, pady=6)
-            txt.pack(fill="both", expand=True)
-            self.notebook.add(tab, text=name)
-            self.tab_texts[name] = txt
-        self.out = self.tab_texts["全部"]  # 兼容导出/外部引用
+        # 方案不在主窗口拆分：生成后在独立窗口以单一页面完整展示
+        tip = ttk.LabelFrame(self, text=" 方案 ", padding=8)
+        tip.pack(fill="x")
+        ttk.Label(tip,
+                  text="点「生成方案」后，完整方案会在独立窗口的单一页面显示；可复制全文、导出 CSV。",
+                  foreground="#666").pack(anchor="w")
 
     # ---- 日期栏刷新 ----
     def _refresh_date_bar(self):
@@ -1033,17 +1025,75 @@ class App(tk.Tk):
     def on_generate(self):
         try:
             accounts, p = self.collect()
-            text, rows, sections = build_plan(accounts, p, self.ctx,
-                                              pack_on_start=self.pack_today_var.get())
+            text, rows, _sections = build_plan(accounts, p, self.ctx,
+                                               pack_on_start=self.pack_today_var.get())
             self.last_rows = rows
-            for name, content in sections:
-                if name in self.tab_texts:
-                    w = self.tab_texts[name]
-                    w.delete("1.0", "end")
-                    w.insert("1.0", content)
             self._auto_save()  # 生成时顺手保存，改动即时落盘
+            self._show_plan(text)  # 方案在独立窗口以单一页面完整展示
         except Exception as e:
             messagebox.showerror("无法生成方案", str(e))
+
+    # ---- 方案独立页面：一页看完整方案，不拆分页签 ----
+    def _show_plan(self, text):
+        win = getattr(self, "plan_win", None)
+        if win is not None and win.winfo_exists():
+            # 已打开则刷新同一个窗口，避免堆一堆窗口
+            txt = self.plan_text
+            txt.configure(state="normal")
+            txt.delete("1.0", "end")
+            txt.insert("1.0", text)
+            txt.configure(state="disabled")
+            txt.yview_moveto(0)
+            self.plan_status_var.set("方案生成时间：%s ｜ 向下滚动查看完整内容" %
+                                     datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
+            win.lift()
+            win.focus_set()
+            return
+
+        win = tk.Toplevel(self)
+        self.plan_win = win
+        win.title("方案 - %s" % APP_NAME)
+        win.geometry("1000x800")
+        win.minsize(720, 520)
+
+        bar = ttk.Frame(win, padding=(10, 8))
+        bar.pack(fill="x")
+        self.plan_status_var = tk.StringVar()
+        ttk.Label(bar, textvariable=self.plan_status_var, foreground="#0a6").pack(side="left")
+        ttk.Button(bar, text="关闭", command=self._close_plan).pack(side="right", padx=3)
+        ttk.Button(bar, text="复制全文", command=self._copy_plan).pack(side="right", padx=3)
+        ttk.Button(bar, text="导出明细CSV", command=self.on_export).pack(side="right", padx=3)
+
+        body = ttk.Frame(win, padding=(10, 0, 10, 10))
+        body.pack(fill="both", expand=True)
+        txt = scrolledtext.ScrolledText(body, wrap="word", font=("Microsoft YaHei", 10),
+                                        padx=12, pady=10, spacing1=2, spacing3=2)
+        txt.pack(fill="both", expand=True)
+        txt.insert("1.0", text)
+        txt.configure(state="disabled")  # 只读，防止误改方案
+        self.plan_text = txt
+        self.plan_status_var.set("方案生成时间：%s ｜ 向下滚动查看完整内容" %
+                                 datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
+        win.protocol("WM_DELETE_WINDOW", self._close_plan)
+        win.after(80, lambda: (win.lift(), win.focus_set()))
+
+    def _close_plan(self):
+        win = getattr(self, "plan_win", None)
+        if win is not None and win.winfo_exists():
+            win.destroy()
+        self.plan_win = None
+        self.plan_text = None
+
+    def _copy_plan(self):
+        txt = getattr(self, "plan_text", None)
+        if txt is None:
+            return
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(txt.get("1.0", "end-1c"))
+            messagebox.showinfo("已复制", "方案全文已复制到剪贴板。", parent=self.plan_win)
+        except Exception as e:
+            messagebox.showerror("复制失败", str(e), parent=self.plan_win)
 
     def on_export(self):
         if not self.last_rows:
@@ -1057,7 +1107,10 @@ class App(tk.Tk):
         try:
             with open(path, "w", newline="", encoding="utf-8-sig") as f:
                 csv.writer(f).writerows(self.last_rows)
-            messagebox.showinfo("成功", "已导出：%s" % path)
+            parent = getattr(self, "plan_win", None)
+            if parent is not None and not parent.winfo_exists():
+                parent = None
+            messagebox.showinfo("成功", "已导出：%s" % path, parent=parent)
         except Exception as e:
             messagebox.showerror("导出失败", str(e))
 

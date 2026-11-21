@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-秒点规划器 v1.7.0
+秒点规划器 v1.7.1
 根据每个账号当前秒点余额，模拟并生成「点赞 / 登录领奖 / 复制转账 / 打包」的执行方案。
 用 Python 3.12 + tkinter，可打包为单文件 exe。
 """
@@ -23,7 +23,7 @@ import datetime
 import calendar
 
 APP_NAME = "秒点规划器"
-VERSION = "1.7.0"
+VERSION = "1.7.1"
 APP_VERSION = VERSION   # 版本更新模块使用
 
 # ===== 内置「版本更新」配置 =====
@@ -764,8 +764,8 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("%s v%s" % (APP_NAME, VERSION))
-        self.geometry("960x640")
-        self.minsize(880, 560)
+        self.geometry("960x780")
+        self.minsize(880, 700)
         self.configure(padx=10, pady=8)
         self.rows = []
         self.small_counter = 0

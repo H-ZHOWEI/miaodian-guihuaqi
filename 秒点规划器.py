@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-秒点规划器 v1.8.0
+秒点规划器 v1.9.0
 根据每个账号当前秒点余额，模拟并生成「点赞 / 登录领奖 / 复制转账 / 打包」的执行方案。
 用 Python 3.12 + tkinter，可打包为单文件 exe。
 """
@@ -23,7 +23,7 @@ import datetime
 import calendar
 
 APP_NAME = "秒点规划器"
-VERSION = "1.8.0"
+VERSION = "1.9.0"
 APP_VERSION = VERSION   # 版本更新模块使用
 
 # ===== 内置「版本更新」配置 =====
@@ -533,8 +533,9 @@ def simulate_big(ac, p, income_by_day, start_day=1, rest_days=None, pack_on_star
 
 
 def build_plan(accounts, p, ctx=None, pack_on_start=False):
-    """生成 (完整文本, csv行列表, 分板块列表, 每日动作表)。
+    """生成 (完整文本, csv行列表, 分板块列表, 每日动作表, 每日余额曲线, 每日登录曲线)。
     每日动作表: {日: {账号备注: [动作, ...]}}，供「确认采用」后主页面每日展示。
+    余额/登录曲线: {日: {账号备注: 当天结束值}}，供采用后按日期自动推进当前秒点。
     """
     ctx = ctx or month_context()
     start_day = ctx["start_day"]
@@ -736,7 +737,34 @@ def build_plan(accounts, p, ctx=None, pack_on_start=False):
     for d, action, amt, bal in bev:
         rows.append([d, "大号", big["note"], action, round(amt, 2), round(bal, 2)])
 
-    return full_text, rows, sections, actions_by_day
+    # ---- 每日余额/登录曲线：按每个号每天「最后一条事件的余额」取整日终值 ----
+    balance_curve = {}   # day -> {note: 日终余额}
+    login_curve = {}     # day -> {note: 日终已领登录天数}
+    for ac, copies, ev, ai, eb, lu in small_results:
+        for d, action, amt, bal in ev:
+            balance_curve.setdefault(d, {})[ac["note"]] = round(bal, 2)
+    for d, action, amt, bal in bev:
+        balance_curve.setdefault(d, {})[big["note"]] = round(bal, 2)
+    # 登录天数：按方案模拟实际领取（起始日已领 + 方案期内领的天数，封顶 login_days_cap）
+    big_login_start = int(big.get("login_claimed", 0))
+    for idx, ac in enumerate(small_results):
+        start_lc = int(ac[0].get("login_claimed", 0))
+        _fill_login_curve(login_curve, ac[0]["note"], start_lc, p, start_day, rest_days)
+    _fill_login_curve(login_curve, big["note"], big_login_start, p, start_day, rest_days)
+
+    return full_text, rows, sections, actions_by_day, balance_curve, login_curve
+
+
+def _fill_login_curve(curve, note, start_claimed, p, start_day, rest_days):
+    """按方案规则填充某账号逐日「累计已领登录天数」。"""
+    cap = int(p["login_days_cap"])
+    left = max(0, cap - start_claimed)
+    claimed = start_claimed
+    for d in range(start_day, start_day + int(p["plan_days"])):
+        if d not in rest_days and left > 0:
+            claimed += 1
+            left -= 1
+        curve.setdefault(d, {})[note] = claimed
 
 
 # ---------- GUI ----------
@@ -794,6 +822,7 @@ class App(tk.Tk):
         # 今日执行面板：每 30 秒与窗口重新获得焦点时按系统日期自动刷新
         self._today_key = datetime.date.today().isoformat()
         self._refresh_today_panel()
+        self._advance_balances()   # 启动时按方案把当前秒点推进到今天
         self.after(30000, self._tick_today)
         self.bind("<FocusIn>", lambda e: self._tick_today(check_only=True))
         # 关闭窗口时自动保存，用户无需手动点
@@ -878,6 +907,9 @@ class App(tk.Tk):
                   font=("Microsoft YaHei", 10, "bold"), foreground="#066").pack(anchor="w")
         self.today_lines = ttk.Frame(self.today_frame)
         self.today_lines.pack(fill="x", pady=(2, 0))
+        self.balance_sync_var = tk.StringVar()
+        ttk.Label(self.today_frame, textvariable=self.balance_sync_var,
+                  foreground="#0a6").pack(anchor="w", pady=(4, 0))
 
         # 起始状态开关区
         sw = ttk.LabelFrame(self, text=" 执行状态（生成方案前先确认） ", padding=6)
@@ -955,6 +987,7 @@ class App(tk.Tk):
         if key != getattr(self, "_today_key", None):
             self._today_key = key
             self._refresh_today_panel()
+            self._advance_balances()   # 跨天自动推进当前秒点
         if not check_only:
             self.after(30000, self._tick_today)
 
@@ -1000,6 +1033,155 @@ class App(tk.Tk):
             txt = "· %s：%s" % (note, "、".join(acts) if acts else "静默（不登录、不操作）")
             ttk.Label(self.today_lines, text=txt).pack(anchor="w")
 
+    # ---- 当前秒点按方案自动推进 ----
+    def _rebuild_plan_curves(self, plan):
+        """兼容旧版方案：只有 actions 没有余额曲线时，用当前账号/参数重算一份。
+        仅在用户没有手改余额时结果准确；给出提示让用户知情。
+        """
+        try:
+            accounts, p = self.collect()   # 会重建 self.ctx，但方案日期用 plan 里的
+            py, pm = int(plan["year"]), int(plan["month"])
+            ps, pe = int(plan["start_day"]), int(plan["end_day"])
+            plan_start = datetime.date(py, pm, ps)
+            rest = set()
+            for d in range(ps, pe + 1):
+                if datetime.date(py, pm, d).weekday() == 6:
+                    rest.add(d)
+            ctx = {
+                "year": py, "month": pm, "start_day": ps, "days_in_month": pe,
+                "plan_days": max(1, pe - ps + 1), "rest_days": rest,
+                "weekday": WEEK_CN[plan_start.weekday()], "today_done": False,
+            }
+            _text, _rows, _secs, _acts, bal_curve, login_curve = build_plan(
+                accounts, p, ctx, pack_on_start=bool(plan.get("packed_on_start", False)))
+            plan["balance_curve"] = {str(d): dict(v) for d, v in bal_curve.items()}
+            plan["login_curve"] = {str(d): dict(v) for d, v in login_curve.items()}
+            plan["start_bal"] = {a["note"]: float(a["balance"]) for a in accounts}
+            plan["start_login"] = {a["note"]: int(a.get("login_claimed", 0)) for a in accounts}
+            plan["login_cap"] = int(p["login_days_cap"])
+            plan.pop("last_advance_day", None)
+            self._auto_save()
+            self.balance_sync_var.set(
+                "✓ 已按当前填写的余额/参数为方案补出每日曲线；从现在起当前秒点会自动推进。")
+            return True
+        except Exception:
+            self.balance_sync_var.set("当前方案缺少余额曲线，请重新生成并采用一次以启用自动扣点。")
+            return False
+
+    def _curve_value(self, curve, day, note, fallback):
+        """取某账号某日的日终值。
+        方案起始日之前 → 返回起始余额（fallback）；
+        方案结束之后 → 取最后一天；缺失 → 回退起始值。
+        """
+        if not curve:
+            return fallback
+        keys = sorted(int(k) for k in curve.keys())
+        if not keys:
+            return fallback
+        if day < keys[0]:
+            return fallback
+        d = min(day, keys[-1])
+        v = curve.get(str(d), {}).get(note)
+        return fallback if v is None else v
+
+    def _advance_balances(self):
+        """把各号「当前秒点 / 已领登录天数」按方案推进到今天。
+
+        用「每日增量」推进而非直接套方案绝对值：这样你在中途手动改过的余额
+        会作为新基准保留，之后的扣/加继续在你的数值上叠加，不会被方案冲掉。
+        """
+        plan = getattr(self, "adopted_plan", None)
+        if not plan:
+            return False
+        if not plan.get("balance_curve"):
+            if not self._rebuild_plan_curves(plan):
+                return False
+        try:
+            py, pm = int(plan["year"]), int(plan["month"])
+            ps, pe = int(plan["start_day"]), int(plan["end_day"])
+        except Exception:
+            return False
+        today = datetime.date.today()
+        done = bool(self.today_done_var.get())
+
+        # 目标日：方案当月内取今天/昨天；早于方案月取起始日前一天；晚于方案月取月末
+        if (today.year, today.month) < (py, pm):
+            target = ps - 1
+        elif (today.year, today.month) > (py, pm):
+            target = pe
+        else:
+            target = today.day if done else today.day - 1
+            target = min(max(target, ps - 1), pe)
+
+        last = plan.get("last_advance_day")
+        if last is None:
+            plan["last_advance_day"] = ps - 1
+            last = ps - 1
+        last = int(last)
+        if last >= target:
+            self._set_balance_sync_note(plan, target, unchanged=True)
+            return False
+
+        bal_curve = plan.get("balance_curve", {})
+        login_curve = plan.get("login_curve", {})
+        start_bal = plan.get("start_bal", {})
+        cap = int(plan.get("login_cap", 7))
+
+        changed = False
+        self._binding_saves = True
+        try:
+            for r in self.rows:
+                note = r.note_var.get().strip()
+                if not note or note not in start_bal:
+                    continue  # 新增/改名的号不在方案内，跳过
+                prev = self._curve_value(bal_curve, last, note, float(start_bal[note]))
+                nowv = self._curve_value(bal_curve, target, note, float(start_bal[note]))
+                delta = nowv - prev
+                if abs(delta) > 0.005:
+                    try:
+                        cur = float(r.bal_var.get() or 0)
+                    except ValueError:
+                        cur = 0.0
+                    newv = round(cur + delta, 2)
+                    if newv >= 0:   # 余额扣成负数说明曲线异常，放弃这一号
+                        r.bal_var.set("%g" % newv)
+                        changed = True
+                # 登录天数按同样增量推进
+                lprev = self._curve_value(login_curve, last, note, 0)
+                lnow = self._curve_value(login_curve, target, note, 0)
+                ldelta = int(round(lnow - lprev))
+                if ldelta:
+                    try:
+                        lcur = int(r.login_var.get() or 0)
+                    except ValueError:
+                        lcur = 0
+                    lnew = max(0, min(cap, lcur + ldelta))
+                    if lnew != lcur:
+                        r.login_var.set(str(lnew))
+                        changed = True
+        finally:
+            self._binding_saves = False
+
+        plan["last_advance_day"] = target
+        self._auto_save()   # 推进日期必须落盘，避免重启后重复叠加同一段增量
+        self._set_balance_sync_note(plan, target, unchanged=not changed)
+        return changed
+
+    def _set_balance_sync_note(self, plan, target, unchanged=False):
+        try:
+            py, pm = int(plan["year"]), int(plan["month"])
+            if target < int(plan["start_day"]):
+                self.balance_sync_var.set("当前秒点：方案尚未开始，保持你填写的起始余额。")
+            elif target > int(plan["end_day"]):
+                self.balance_sync_var.set("✓ 当前秒点已按方案推进到 %d月%d日（月末）；本月方案已结束。" % (pm, int(plan["end_day"])))
+            else:
+                word = "已同步" if unchanged else "已自动推进"
+                self.balance_sync_var.set(
+                    "✓ 当前秒点%s到 %d月%d日：按方案扣/加（点赞、复制、后端等）；手改过的余额会保留并继续叠加。"
+                    % (word, pm, target))
+        except Exception:
+            pass
+
     # ---- 字段改动即时保存（防抖）----
     def _schedule_save(self, *args):
         """任一输入变化后 0.6 秒自动保存；灌配置期间跳过。"""
@@ -1026,6 +1208,7 @@ class App(tk.Tk):
 
     def _on_switch_changed(self):
         self._refresh_date_bar()
+        self._advance_balances()   # 勾选今天已操作 → 推进到今天的余额
         self._auto_save()
         try:
             self.save_status_var.set("✓ 已自动保存")
@@ -1103,7 +1286,7 @@ class App(tk.Tk):
     def on_generate(self):
         try:
             accounts, p = self.collect()
-            text, rows, _sections, actions = build_plan(
+            text, rows, _sections, actions, balance_curve, login_curve = build_plan(
                 accounts, p, self.ctx, pack_on_start=self.pack_today_var.get())
             self.last_rows = rows
             c = self.ctx
@@ -1111,6 +1294,12 @@ class App(tk.Tk):
                 "year": c["year"], "month": c["month"],
                 "start_day": c["start_day"], "end_day": c["days_in_month"],
                 "actions": {str(d): dict(v) for d, v in actions.items()},
+                "balance_curve": {str(d): dict(v) for d, v in balance_curve.items()},
+                "login_curve": {str(d): dict(v) for d, v in login_curve.items()},
+                "start_bal": {a["note"]: float(a["balance"]) for a in accounts},
+                "start_login": {a["note"]: int(a.get("login_claimed", 0)) for a in accounts},
+                "login_cap": int(p["login_days_cap"]),
+                "packed_on_start": bool(self.pack_today_var.get()),
             }
             self._auto_save()  # 生成时顺手保存，改动即时落盘
             self._show_plan(text)  # 方案在独立窗口以单一页面完整展示
@@ -1172,11 +1361,14 @@ class App(tk.Tk):
             return
         self.adopted_plan = dict(plan)
         self.adopted_plan["adopted_at"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+        self.adopted_plan.pop("last_advance_day", None)  # 新方案从头推进
         self._auto_save()
         self.plan_tip.pack_forget()   # 采用后不再需要生成引导，留出今日执行空间
         self._refresh_today_panel()
+        self._advance_balances()      # 采用即按方案推进当天余额
         self._close_plan()
-        messagebox.showinfo("已采用", "方案已采用。主页面会每天自动显示当天各号该做什么。",
+        messagebox.showinfo("已采用",
+                            "方案已采用。主页面会每天自动显示当天各号该做什么，当前秒点也会按方案自动扣/加。",
                             parent=self)
 
     def _close_plan(self):

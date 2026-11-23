@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-秒点规划器 v1.9.1
+秒点规划器 v1.9.2
 根据每个账号当前秒点余额，模拟并生成「点赞 / 登录领奖 / 复制转账 / 打包」的执行方案。
 用 Python 3.12 + tkinter，可打包为单文件 exe。
 """
@@ -23,7 +23,7 @@ import datetime
 import calendar
 
 APP_NAME = "秒点规划器"
-VERSION = "1.9.1"
+VERSION = "1.9.2"
 APP_VERSION = VERSION   # 版本更新模块使用
 
 # ===== 内置「版本更新」配置 =====
@@ -1165,8 +1165,12 @@ class App(tk.Tk):
 
         last = plan.get("last_advance_day")
         if last is None:
-            plan["last_advance_day"] = ps - 1
-            last = ps - 1
+            # 关键：新方案以「起始日」为基准，不再从起始日前一天开始算。
+            # 用户填的当前秒点就是起始日当天的真实余额，起始日当天的点赞/复制
+            # 收益不该再由软件补算（否则每个号都会凭空多出一天点赞=+20）。
+            # 只有从「次日」起的动作才通过曲线增量叠加到用户填的基准上。
+            plan["last_advance_day"] = ps
+            last = ps
         last = int(last)
         if last >= target:
             self._set_balance_sync_note(plan, target, unchanged=True)

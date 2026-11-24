@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-秒点规划器 v1.9.3
+秒点规划器 v1.9.4
 根据每个账号当前秒点余额，模拟并生成「点赞 / 登录领奖 / 复制转账 / 打包」的执行方案。
 用 Python 3.12 + tkinter，可打包为单文件 exe。
 """
@@ -23,7 +23,7 @@ import datetime
 import calendar
 
 APP_NAME = "秒点规划器"
-VERSION = "1.9.3"
+VERSION = "1.9.4"
 APP_VERSION = VERSION   # 版本更新模块使用
 
 # ===== 内置「版本更新」配置 =====
@@ -1166,21 +1166,43 @@ class App(tk.Tk):
 
         last = plan.get("last_advance_day")
         if last is None:
-            # 关键：新方案以「起始日」为基准，不再从起始日前一天开始算。
-            # 用户填的当前秒点就是起始日当天的真实余额，起始日当天的点赞/复制
-            # 收益不该再由软件补算（否则每个号都会凭空多出一天点赞=+20）。
-            # 只有从「次日」起的动作才通过曲线增量叠加到用户填的基准上。
+            # 新方案以「起始日」为基准：用户填的当前秒点是起始日操作前的真实
+            # 余额，起始日当天的收益不补算；勾选「今天已操作」才推进到收盘。
             plan["last_advance_day"] = ps
             last = ps
         last = int(last)
-        if last >= target:
+        # 标记语义 eod：True=标记日 d 表示「第 d 天收盘」余额（含当天动作）；
+        # False=起始日标记表示「操作前余额」（刚采用方案、还没勾选已操作）。
+        # 旧版方案没有该标记：标记日大于起始日的按收盘理解。
+        eod = bool(plan.get("eod_marker", last > ps))
+        if last == target and (eod or done or target != ps):
             self._set_balance_sync_note(plan, target, unchanged=True)
             return False
 
         bal_curve = plan.get("balance_curve", {})
         login_curve = plan.get("login_curve", {})
         start_bal = plan.get("start_bal", {})
+        start_login = plan.get("start_login", {})
         cap = int(plan.get("login_cap", 7))
+
+        def _eod(d, flag):
+            # 标记日 d 是否按「当日收盘」取曲线值
+            return d > ps or (d == ps and flag)
+
+        prev_eod = eod
+        tgt_eod = eod or done or target > ps
+
+        def bval(d, flag, note):
+            fb = float(start_bal.get(note, 0))
+            if d < ps or not _eod(d, flag):
+                return fb
+            return self._curve_value(bal_curve, d, note, fb)
+
+        def lval(d, flag, note):
+            fb = int(start_login.get(note, 0))
+            if d < ps or not _eod(d, flag):
+                return fb
+            return int(round(self._curve_value(login_curve, d, note, fb)))
 
         changed = False
         self._binding_saves = True
@@ -1189,9 +1211,7 @@ class App(tk.Tk):
                 note = r.note_var.get().strip()
                 if not note or note not in start_bal:
                     continue  # 新增/改名的号不在方案内，跳过
-                prev = self._curve_value(bal_curve, last, note, float(start_bal[note]))
-                nowv = self._curve_value(bal_curve, target, note, float(start_bal[note]))
-                delta = nowv - prev
+                delta = bval(target, tgt_eod, note) - bval(last, prev_eod, note)
                 if abs(delta) > 0.005:
                     try:
                         cur = float(r.bal_var.get() or 0)
@@ -1201,10 +1221,8 @@ class App(tk.Tk):
                     if newv >= 0:   # 余额扣成负数说明曲线异常，放弃这一号
                         r.bal_var.set("%g" % newv)
                         changed = True
-                # 登录天数按同样增量推进
-                lprev = self._curve_value(login_curve, last, note, 0)
-                lnow = self._curve_value(login_curve, target, note, 0)
-                ldelta = int(round(lnow - lprev))
+                # 登录天数按同样增量推进/回退
+                ldelta = lval(target, tgt_eod, note) - lval(last, prev_eod, note)
                 if ldelta:
                     try:
                         lcur = int(r.login_var.get() or 0)
@@ -1218,11 +1236,16 @@ class App(tk.Tk):
             self._binding_saves = False
 
         plan["last_advance_day"] = target
+        if target < ps:
+            plan["eod_marker"] = False
+        elif tgt_eod or last > ps:
+            plan["eod_marker"] = True
         self._auto_save()   # 推进日期必须落盘，避免重启后重复叠加同一段增量
-        self._set_balance_sync_note(plan, target, unchanged=not changed)
+        self._set_balance_sync_note(plan, target, unchanged=not changed,
+                                    rolled_back=target < last)
         return changed
 
-    def _set_balance_sync_note(self, plan, target, unchanged=False):
+    def _set_balance_sync_note(self, plan, target, unchanged=False, rolled_back=False):
         try:
             py, pm = int(plan["year"]), int(plan["month"])
             if target < int(plan["start_day"]):
@@ -1230,8 +1253,13 @@ class App(tk.Tk):
             elif target > int(plan["end_day"]):
                 self.balance_sync_var.set("✓ 当前秒点已按方案推进到 %d月%d日（月末）；本月方案已结束。" % (pm, int(plan["end_day"])))
             else:
-                word = "已同步" if unchanged else "已自动推进"
-                msg = ("✓ 当前秒点%s到 %d月%d日收盘（含该日操作后的余额）：按方案扣/加"
+                if rolled_back:
+                    word = "已回退"
+                elif unchanged:
+                    word = "已同步"
+                else:
+                    word = "已自动推进"
+                msg = ("✓ 当前秒点%s %d月%d日收盘（含该日操作后的余额）：按方案扣/加"
                        "（点赞、复制、后端等）；手改过的余额会保留并继续叠加。")
                 today = datetime.date.today()
                 if (not bool(self.today_done_var.get())

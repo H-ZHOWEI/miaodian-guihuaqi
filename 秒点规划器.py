@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-秒点规划器 v1.9.2
+秒点规划器 v1.9.3
 根据每个账号当前秒点余额，模拟并生成「点赞 / 登录领奖 / 复制转账 / 打包」的执行方案。
 用 Python 3.12 + tkinter，可打包为单文件 exe。
 """
@@ -23,7 +23,7 @@ import datetime
 import calendar
 
 APP_NAME = "秒点规划器"
-VERSION = "1.9.2"
+VERSION = "1.9.3"
 APP_VERSION = VERSION   # 版本更新模块使用
 
 # ===== 内置「版本更新」配置 =====
@@ -991,6 +991,7 @@ class App(tk.Tk):
         key = datetime.date.today().isoformat()
         if key != getattr(self, "_today_key", None):
             self._today_key = key
+            self._refresh_date_bar()   # 跨天同步刷新日期栏，避免一直显示昨天
             self._refresh_today_panel()
             self._advance_balances()   # 跨天自动推进当前秒点
         if not check_only:
@@ -1230,9 +1231,17 @@ class App(tk.Tk):
                 self.balance_sync_var.set("✓ 当前秒点已按方案推进到 %d月%d日（月末）；本月方案已结束。" % (pm, int(plan["end_day"])))
             else:
                 word = "已同步" if unchanged else "已自动推进"
-                self.balance_sync_var.set(
-                    "✓ 当前秒点%s到 %d月%d日：按方案扣/加（点赞、复制、后端等）；手改过的余额会保留并继续叠加。"
-                    % (word, pm, target))
+                msg = ("✓ 当前秒点%s到 %d月%d日收盘（含该日操作后的余额）：按方案扣/加"
+                       "（点赞、复制、后端等）；手改过的余额会保留并继续叠加。")
+                today = datetime.date.today()
+                if (not bool(self.today_done_var.get())
+                        and (today.year, today.month) == (py, pm)
+                        and today.day == target + 1):
+                    msg += "今天(%d月%d日)还没勾「今天各号已全部操作过」，操作完勾上即推进到今天。"
+                    self.balance_sync_var.set(
+                        msg % (word, pm, target, pm, today.day))
+                else:
+                    self.balance_sync_var.set(msg % (word, pm, target))
         except Exception:
             pass
 

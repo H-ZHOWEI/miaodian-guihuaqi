@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-秒点规划器 v1.12.1
+秒点规划器 v1.12.2
 根据每个账号当前秒点余额，模拟并生成「点赞 / 登录领奖 / 复制转账 / 打包」的执行方案。
 用 Python 3.12 + tkinter，可打包为单文件 exe。
 """
@@ -10,6 +10,8 @@ import json
 import csv
 import os
 import sys
+import calendar
+import unicodedata
 import re
 import shutil
 import time
@@ -23,7 +25,7 @@ import datetime
 import calendar
 
 APP_NAME = "秒点规划器"
-VERSION = "1.12.1"
+VERSION = "1.12.2"
 APP_VERSION = VERSION   # 版本更新模块使用
 
 # ===== 内置「版本更新」配置 =====
@@ -415,10 +417,35 @@ def _expire(queue, day, expiry):
     return [(s, a) for s, a in queue if day - s < expiry]
 
 
-def simulate_small(ac, p, start_day=1, rest_days=None):
-    """模拟一个小号。返回 (copies, daily_events, author_income, end_balance, login_used)
+def _disp_w(s):
+    """字符串显示宽度：中文等全角字符按 2 列算，供纯文本表格对齐。"""
+    return sum(2 if unicodedata.east_asian_width(c) in "FWA" else 1 for c in str(s))
+
+
+def _pad(s, width, align="left"):
+    """按显示宽度补空格到 width 列，中文不再歪歪扭扭。"""
+    s = str(s)
+    gap = width - _disp_w(s)
+    if gap <= 0:
+        return s
+    return (s + " " * gap) if align == "left" else (" " * gap + s)
+
+
+def _day_text(year, month, day, days_in_month=None):
+    """把「当月第 day 天」转成真实日期文本；超过当月天数自动跨到下个月显示。"""
+    if days_in_month is None:
+        days_in_month = calendar.monthrange(year, month)[1]
+    if day <= days_in_month:
+        return "%d月%d日" % (month, day)
+    y2, m2 = (year + 1, 1) if month == 12 else (year, month + 1)
+    return "%d月%d日" % (m2, day - days_in_month)
+
+
+def simulate_small(ac, p, start_day=1, rest_days=None, cal=None):
+    """模拟一个小号。返回 (copies, daily_events, author_income, end_balance, login_used, queue)
     start_day: 方案起始的真实日历日（今天几号），所有 day 均为日历日。
     rest_days: 周日集合，这些天零收入（不点赞、不登录、不复制），但秒点照常过期。
+    cal: {"year","month","days"} 日历信息，供过期标注跨月显示真实日期；缺省按「N日」标注。
     """
     rest_days = rest_days or set()
     like_gain = p["like_gain"] * p["like_per_day"]
@@ -466,7 +493,11 @@ def simulate_small(ac, p, start_day=1, rest_days=None):
             now = _bal()
             label = "登录领奖+点赞" if login_flag else "点赞"
             if p["expiry_days"] > 0:
-                label += "(本批%d日过期)" % (d + p["expiry_days"])
+                if cal:
+                    label += "(本批%s过期)" % _day_text(
+                        cal["year"], cal["month"], d + p["expiry_days"], cal["days"])
+                else:
+                    label += "(本批%d日过期)" % (d + p["expiry_days"])
             if pay > 0:
                 label += "(其中%g还欠费)" % round(pay, 2)
             events.append((d, label, round(gain + pay, 2), now))
@@ -487,7 +518,7 @@ def simulate_small(ac, p, start_day=1, rest_days=None):
     return copies, events, author_income, _total(queue) - debt, login_granted, queue
 
 
-def simulate_big(ac, p, income_by_day, start_day=1, rest_days=None, pack_on_start=False):
+def simulate_big(ac, p, income_by_day, start_day=1, rest_days=None, pack_on_start=False, cal=None):
     """模拟大号。income_by_day: dict day(日历日)->小号转账金额。
     rest_days: 周日集合，这些天零收入，但后端照常扣费。
     pack_on_start: 用户勾选「起始日打包」→ 仅在起始日打包一次并扣点；平时不自动打包。
@@ -542,7 +573,11 @@ def simulate_big(ac, p, income_by_day, start_day=1, rest_days=None, pack_on_star
         else:
             label = "收款+活跃"
             if p["expiry_days"] > 0:
-                label += "(本批%d日过期)" % (d + p["expiry_days"])
+                if cal:
+                    label += "(本批%s过期)" % _day_text(
+                        cal["year"], cal["month"], d + p["expiry_days"], cal["days"])
+                else:
+                    label += "(本批%d日过期)" % (d + p["expiry_days"])
             if pay > 0:
                 label += "(其中%g还欠费)" % round(pay, 2)
             events.append((d, label, round(day_gain + inc, 2), _bal()))
@@ -591,17 +626,19 @@ def build_plan(accounts, p, ctx=None, pack_on_start=False):
     big = bigs[0]
 
     # 先跑小号
+    cal = {"year": ctx["year"], "month": ctx["month"], "days": ctx["days_in_month"]}
     small_results = []
     income_by_day = {}
     for ac in smalls:
-        copies, ev, author_income, endbal, login_used, q = simulate_small(ac, p, start_day, rest_days)
+        copies, ev, author_income, endbal, login_used, q = simulate_small(
+            ac, p, start_day, rest_days, cal=cal)
         small_results.append((ac, copies, ev, author_income, endbal, login_used, q))
         per = p["work_price"] * (1 - p["copy_fee_pct"] / 100.0)
         for d, wi in copies:
             income_by_day[d] = income_by_day.get(d, 0.0) + per
 
     packs, bev, bend, big_login_used, packable_days, bqueue = simulate_big(
-        big, p, income_by_day, start_day, rest_days, pack_on_start)
+        big, p, income_by_day, start_day, rest_days, pack_on_start, cal=cal)
 
     # ---- 到期预警：平台优先消耗「即将到期」的秒点；到期没用掉的批次会自然流失 ----
     # 每个批次记录 (获得日, 过期日=获得日+有效期, 剩余点)。当前余额近似按「起始日获得」
@@ -652,8 +689,10 @@ def build_plan(accounts, p, ctx=None, pack_on_start=False):
     for note in [ac["note"] for ac in smalls] + [big["note"]]:
         for s, e, a in expiry_info.get(note, []):
             if e <= start_day + p["plan_days"]:
-                warn_lines.append("  ⚠ %s：%g 点（%d日获得的）将于 %d日 到期，没用掉就流失"
-                                  % (note, a, s, e))
+                warn_lines.append("  ⚠ %s：%g 点（%s获得的）将于 %s 到期，没用掉就流失"
+                                  % (note, a,
+                                     _day_text(ctx["year"], ctx["month"], s, ctx["days_in_month"]),
+                                     _day_text(ctx["year"], ctx["month"], e, ctx["days_in_month"])))
     if warn_lines:
         sec_overview.append("到期提醒（平台优先消耗快到期的秒点，先到期的先扣）：")
         sec_overview += warn_lines
@@ -1114,17 +1153,27 @@ class App(tk.Tk):
         # 到期预警：平台优先消耗快到期的秒点（先获得的先扣），到期没用掉会自然流失
         def _expiry_warnings(day_obj):
             lines = []
+            try:
+                y_, m_ = int(plan["year"]), int(plan["month"])
+                days_ = int(plan.get("end_day") or calendar.monthrange(y_, m_)[1])
+            except Exception:
+                return lines
             for note, batches in (plan.get("expiry_info") or {}).items():
                 for b in batches:
                     try:
                         e, a = int(b[1]), float(b[2])
-                        edate = datetime.date(int(plan["year"]), int(plan["month"]), e)
+                        if e <= days_:
+                            edate = datetime.date(y_, m_, e)
+                        else:
+                            y2, m2 = (y_ + 1, 1) if m_ == 12 else (y_, m_ + 1)
+                            edate = datetime.date(y2, m2, e - days_)
                     except Exception:
                         continue
                     if edate == day_obj:
                         lines.append("⚠ %s：%g 点今天到期，没用掉今天就流失！" % (note, a))
                     elif edate == day_obj + datetime.timedelta(days=1):
-                        lines.append("⚠ %s：%g 点明天（%d日）到期，尽快用掉" % (note, a, e))
+                        lines.append("⚠ %s：%g 点明天（%s）到期，尽快用掉" %
+                                     (note, a, _day_text(y_, m_, e, days_)))
             return lines
 
         day_actions = actions.get(str(now.day), {})
@@ -1642,6 +1691,11 @@ class App(tk.Tk):
         lines.append("-" * W)
         cur = {}
         exp_info = (plan or {}).get("expiry_info") or {}
+        if plan:
+            py_, pm_ = int(plan["year"]), int(plan["month"])
+            pdays_ = int(plan.get("end_day") or calendar.monthrange(py_, pm_)[1])
+        else:
+            py_ = pm_ = pdays_ = None
         for r in getattr(self, "rows", []):
             try:
                 bal = float(r.bal_var.get() or 0)
@@ -1650,12 +1704,17 @@ class App(tk.Tk):
             note = r.note_var.get().strip() or r.role_var.get()
             cur[note] = bal
             mark = "  ⚠负数" if bal < 0 else ""
-            lines.append("  %-12s %10s 点%s" % (note, ("%g" % bal), mark))
+            lines.append("  %s%s 点%s" % (_pad(note, 14), _pad("%g" % bal, 10, "right"), mark))
             # 附到期批次：平台优先消耗快到期的秒点，到期没用掉就自然流失
+            # 日期跨月时自动显示下个月的真实日期（如 11月28日获得+7天 → 12月5日过期）
             for b in exp_info.get(note, []):
                 try:
-                    lines.append("      ↳ %g 点（%d日获得）→ %d日 过期"
-                                 % (float(b[2]), int(b[0]), int(b[1])))
+                    if py_ is None:
+                        continue
+                    lines.append("      ↳ %s点（%s获得）→ %s过期" % (
+                        _pad("%g" % float(b[2]), 5),
+                        _day_text(py_, pm_, int(b[0]), pdays_),
+                        _day_text(py_, pm_, int(b[1]), pdays_)))
                 except Exception:
                     continue
 
@@ -1674,7 +1733,9 @@ class App(tk.Tk):
             lines.append("  方案区间：%d月%d日～%d日 ｜ 采用时间：%s ｜ 推进到：%s" % (
                 pm, ps, pe, plan.get("adopted_at", "—"),
                 ("%d日收盘" % curday) if curday is not None else "起始前"))
-            lines.append("  %-12s %12s %12s %12s" % ("账号", "方案起始", "方案该日预期", "当前实际"))
+            lines.append("  %s  %s  %s  %s" % (
+                _pad("账号", 14), _pad("方案起始", 12, "right"),
+                _pad("方案该日预期", 14, "right"), _pad("当前实际", 10, "right")))
             for r in getattr(self, "rows", []):
                 note = r.note_var.get().strip() or r.role_var.get()
                 if note not in start_bal:
@@ -1683,10 +1744,11 @@ class App(tk.Tk):
                 expect = None
                 if curday is not None:
                     expect = self._curve_value(bal_curve, curday, note, sb)
-                lines.append("  %-12s %12s %12s %12s" % (
-                    note, ("%g" % float(sb)) if sb is not None else "—",
-                    ("%g" % float(expect)) if expect is not None else "—",
-                    ("%g" % cur.get(note, 0))))
+                lines.append("  %s  %s  %s  %s" % (
+                    _pad(note, 14),
+                    _pad(("%g" % float(sb)) if sb is not None else "—", 12, "right"),
+                    _pad(("%g" % float(expect)) if expect is not None else "—", 14, "right"),
+                    _pad("%g" % cur.get(note, 0), 10, "right")))
             lines.append("  说明：软件按「每日增量」推进，你手工改过的余额会作为新基准继续叠加，")
             lines.append("        所以当前值常与方案模拟值不同；这是正常的，以【一】当前值为准。")
             if curday is None:
@@ -1739,9 +1801,10 @@ class App(tk.Tk):
                             bal = round(base + amt, 2)
                             running[note] = bal
                             mark = "  ⚠负" if bal < 0 else ""
-                            lines.append("     %-4s %-10s %-22s %-26s%s" %
-                                         (role, note, action,
-                                          "%s → %+g → %s" % ("%g" % base, amt, "%g" % bal), mark))
+                            lines.append("     %s %s %s %s%s" %
+                                         (_pad(role, 5), _pad(note, 12), _pad(action, 30),
+                                          _pad("%s → %+g → %s" % ("%g" % base, amt, "%g" % bal), 26),
+                                          mark))
                 else:
                     by_note = {}
                     for row in shown:
@@ -1753,9 +1816,10 @@ class App(tk.Tk):
                             day, amt = int(row[0]), float(row[4])
                             bal = round(base + amt, 2)
                             mark = "  ⚠负" if bal < 0 else ""
-                            lines.append("     %2d日 %-22s %-26s%s" %
-                                         (day, row[3],
-                                          "%s → %+g → %s" % ("%g" % base, amt, "%g" % bal), mark))
+                            lines.append("     %s %s %s%s" %
+                                         (_pad("%d日" % day, 5), _pad(row[3], 30),
+                                          _pad("%s → %+g → %s" % ("%g" % base, amt, "%g" % bal), 26),
+                                          mark))
                             base = bal
 
         # ---- 四、实际加减记录（推进/回退时真实改了多少） ----

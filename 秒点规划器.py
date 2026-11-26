@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-秒点规划器 v1.11.0
+秒点规划器 v1.12.0
 根据每个账号当前秒点余额，模拟并生成「点赞 / 登录领奖 / 复制转账 / 打包」的执行方案。
 用 Python 3.12 + tkinter，可打包为单文件 exe。
 """
@@ -23,7 +23,7 @@ import datetime
 import calendar
 
 APP_NAME = "秒点规划器"
-VERSION = "1.11.0"
+VERSION = "1.12.0"
 APP_VERSION = VERSION   # 版本更新模块使用
 
 # ===== 内置「版本更新」配置 =====
@@ -371,7 +371,7 @@ DEFAULTS = {
     "like_per_day": 20,     # 每天点赞次数上限
     "login_bonus": 100,     # 每日登录奖励
     "login_days_cap": 7,    # 每月可领登录奖励天数
-    "expiry_days": 7,       # 免费秒点有效期（天）
+    "expiry_days": 15,      # 免费秒点有效期（天）·官方2026-07起为15天，旧版7天已过期
     "copy_fee_pct": 20,     # 复制手续费百分比（作者实得 = 定价 * (1 - fee%)）
     "backend_projects": 3,  # 大号后端项目数
     "backend_per_day": 20,  # 每个后端项目每天扣费
@@ -465,6 +465,8 @@ def simulate_small(ac, p, start_day=1, rest_days=None):
             # 还债是收入的内部去向：合并进文案说明，不单列一笔金额对不上的账。
             now = _bal()
             label = "登录领奖+点赞" if login_flag else "点赞"
+            if p["expiry_days"] > 0:
+                label += "(本批%d日过期)" % (d + p["expiry_days"])
             if pay > 0:
                 label += "(其中%g还欠费)" % round(pay, 2)
             events.append((d, label, round(gain + pay, 2), now))
@@ -481,7 +483,8 @@ def simulate_small(ac, p, start_day=1, rest_days=None):
                     break
 
     author_income = len(copies) * price * (1 - p["copy_fee_pct"] / 100.0)
-    return copies, events, author_income, _total(queue) - debt, login_granted
+    # 剩余批次 [(获得日, 剩余点)]：获得日+有效期=过期日，供到期预警
+    return copies, events, author_income, _total(queue) - debt, login_granted, queue
 
 
 def simulate_big(ac, p, income_by_day, start_day=1, rest_days=None, pack_on_start=False):
@@ -538,6 +541,8 @@ def simulate_big(ac, p, income_by_day, start_day=1, rest_days=None, pack_on_star
             events.append((d, "周日休息(无收款)", 0, _bal()))
         else:
             label = "收款+活跃"
+            if p["expiry_days"] > 0:
+                label += "(本批%d日过期)" % (d + p["expiry_days"])
             if pay > 0:
                 label += "(其中%g还欠费)" % round(pay, 2)
             events.append((d, label, round(day_gain + inc, 2), _bal()))
@@ -562,13 +567,15 @@ def simulate_big(ac, p, income_by_day, start_day=1, rest_days=None, pack_on_star
         elif pack_cost > 0 and cur_bal >= pack_cost:
             packable_days.append(d)
 
-    return packs, events, _total(queue) - debt, login_granted, packable_days
+    # 剩余批次 [(获得日, 剩余点)]：获得日+有效期=过期日，供到期预警
+    return packs, events, _total(queue) - debt, login_granted, packable_days, queue
 
 
 def build_plan(accounts, p, ctx=None, pack_on_start=False):
-    """生成 (完整文本, csv行列表, 分板块列表, 每日动作表, 每日余额曲线, 每日登录曲线)。
+    """生成 (完整文本, csv行列表, 分板块列表, 每日动作表, 每日余额曲线, 每日登录曲线, 到期信息)。
     每日动作表: {日: {账号备注: [动作, ...]}}，供「确认采用」后主页面每日展示。
     余额/登录曲线: {日: {账号备注: 当天结束值}}，供采用后按日期自动推进当前秒点。
+    到期信息: {账号备注: [(获得日, 过期日, 剩余点), ...]}，供到期预警与今日面板提醒。
     """
     ctx = ctx or month_context()
     start_day = ctx["start_day"]
@@ -587,14 +594,35 @@ def build_plan(accounts, p, ctx=None, pack_on_start=False):
     small_results = []
     income_by_day = {}
     for ac in smalls:
-        copies, ev, author_income, endbal, login_used = simulate_small(ac, p, start_day, rest_days)
-        small_results.append((ac, copies, ev, author_income, endbal, login_used))
+        copies, ev, author_income, endbal, login_used, q = simulate_small(ac, p, start_day, rest_days)
+        small_results.append((ac, copies, ev, author_income, endbal, login_used, q))
         per = p["work_price"] * (1 - p["copy_fee_pct"] / 100.0)
         for d, wi in copies:
             income_by_day[d] = income_by_day.get(d, 0.0) + per
 
-    packs, bev, bend, big_login_used, packable_days = simulate_big(
+    packs, bev, bend, big_login_used, packable_days, bqueue = simulate_big(
         big, p, income_by_day, start_day, rest_days, pack_on_start)
+
+    # ---- 到期预警：平台优先消耗「即将到期」的秒点；到期没用掉的批次会自然流失 ----
+    # 每个批次记录 (获得日, 过期日=获得日+有效期, 剩余点)。当前余额近似按「起始日获得」
+    # 计算有效期，实际到期日以平台【秒点详情】里最近一笔即将到期的秒点为准。
+    # 同日获得的批次合并为一行，避免重复显示。
+    def _merge_batches(q):
+        merged = {}
+        for s, a in q:
+            if a > 0.005:
+                key = (s, s + p["expiry_days"])
+                merged[key] = round(merged.get(key, 0.0) + a, 2)
+        return [(s, e, a) for (s, e), a in sorted(merged.items())]
+
+    expiry_info = {}   # note -> [(获得日, 过期日, 剩余点)]
+    for ac, copies, ev, ai, eb, lu, q in small_results:
+        batches = _merge_batches(q)
+        if batches:
+            expiry_info[ac["note"]] = batches
+    bb = _merge_batches(bqueue)
+    if bb:
+        expiry_info[big["note"]] = bb
 
     # ---- 文本方案：分板块构建，便于 GUI 分页展示 ----
     sec_overview, sec_today, sec_daily, sec_copy, sec_big = [], [], [], [], []
@@ -619,6 +647,19 @@ def build_plan(accounts, p, ctx=None, pack_on_start=False):
         rest_txt = "、".join("%d日" % d for d in sorted(rest_days))
         sec_overview.append("★ 周日（%s）为休息日：全天无点赞/登录/复制/打包收入，后端照常扣费。" % rest_txt)
 
+    # 到期提醒：官方规则——平台优先消耗「即将到期」的秒点；到期没用掉就自然流失
+    warn_lines = []
+    for note in [ac["note"] for ac in smalls] + [big["note"]]:
+        for s, e, a in expiry_info.get(note, []):
+            if e <= start_day + p["plan_days"]:
+                warn_lines.append("  ⚠ %s：%g 点（%d日获得的）将于 %d日 到期，没用掉就流失"
+                                  % (note, a, s, e))
+    if warn_lines:
+        sec_overview.append("到期提醒（平台优先消耗快到期的秒点，先到期的先扣）：")
+        sec_overview += warn_lines
+    else:
+        sec_overview.append("到期提醒：规划期内没有秒点会到期流失。")
+
     # 板块2：首日各号该做什么
     day_label = "明天" if ctx.get("today_done") else "今天"
     sec_today.append("【%s（%d月%d日 %s）各号该做什么】" %
@@ -629,7 +670,7 @@ def build_plan(accounts, p, ctx=None, pack_on_start=False):
         sec_today.append("    只有大号后端照扣 %d 点。等周一再恢复操作。" %
                          (p["backend_projects"] * p["backend_per_day"]))
     else:
-        for ac, copies, ev, ai, eb, lu in small_results:
+        for ac, copies, ev, ai, eb, lu, _q in small_results:
             login_left = max(0, p["login_days_cap"] - int(ac.get("login_claimed", 0)))
             today_copies = [wi for d, wi in copies if d == start_day]
             login_txt = "登录领奖+点赞" if login_left > 0 else "点赞(已领满登录)"
@@ -666,7 +707,7 @@ def build_plan(accounts, p, ctx=None, pack_on_start=False):
         if "收款+活跃" in a:
             return "收款"
         return a
-    for ac, copies, ev, ai, eb, lu in small_results:
+    for ac, copies, ev, ai, eb, lu, _q in small_results:
         for d, action, amt, bal in ev:
             acts = actions_by_day.setdefault(d, {}).setdefault(ac["note"], [])
             s = _short_action(action)
@@ -696,7 +737,7 @@ def build_plan(accounts, p, ctx=None, pack_on_start=False):
             sec_daily.append("      %s：%s" % (note, "、".join(acts) if acts else "静默"))
 
     # 板块4：小号复制排期
-    for ac, copies, ev, ai, eb, lu in small_results:
+    for ac, copies, ev, ai, eb, lu, _q in small_results:
         sec_copy.append("【%s】当前 %g 点｜本月已领登录 %d 天（方案内再领 %d 天）" %
                         (ac["note"], ac["balance"], int(ac.get("login_claimed", 0)), lu))
         sec_copy.append("  复制 %d 次 → 为大号贡献 %g 点；月末余额约 %g 点" %
@@ -742,6 +783,8 @@ def build_plan(accounts, p, ctx=None, pack_on_start=False):
         sec_big.append("提示：作品数量建议≥2，否则同一账号可能连续复制同一作品。")
     sec_big.append("说明：方案按真实日历日排布（%d月%d日～%d日）；当前余额按起始日可用计入并从起始日起算有效期；" %
                    (ctx["month"], ctx["start_day"], ctx["days_in_month"]))
+    sec_big.append("      平台优先消耗快到期的秒点（先获得的先扣），到期没用掉会自然流失；现有余额的")
+    sec_big.append("      真实到期日以平台【首页→秒点→最近一笔即将到期】为准，本方案按起始日+%d天近似。" % p["expiry_days"])
     sec_big.append("      余额请填「调整好作品之后」的实际数（调整消耗的秒点已含在内，软件不再另扣）。")
     sec_big.append("      打包平时不自动做；要打包就在界面勾选，生成时只扣那一次。改了余额记得重新生成。")
 
@@ -764,7 +807,7 @@ def build_plan(accounts, p, ctx=None, pack_on_start=False):
 
     # ---- CSV 明细 ----
     rows = [["日期(号)", "账号", "备注", "动作", "变动(点)", "操作后余额"]]
-    for ac, copies, ev, ai, eb, lu in small_results:
+    for ac, copies, ev, ai, eb, lu, _q in small_results:
         for d, action, amt, bal in ev:
             rows.append([d, "小号", ac["note"], action, round(amt, 2), round(bal, 2)])
     for d, action, amt, bal in bev:
@@ -773,7 +816,7 @@ def build_plan(accounts, p, ctx=None, pack_on_start=False):
     # ---- 每日余额/登录曲线：按每个号每天「最后一条事件的余额」取整日终值 ----
     balance_curve = {}   # day -> {note: 日终余额}
     login_curve = {}     # day -> {note: 日终已领登录天数}
-    for ac, copies, ev, ai, eb, lu in small_results:
+    for ac, copies, ev, ai, eb, lu, _q in small_results:
         for d, action, amt, bal in ev:
             balance_curve.setdefault(d, {})[ac["note"]] = round(bal, 2)
     for d, action, amt, bal in bev:
@@ -785,7 +828,7 @@ def build_plan(accounts, p, ctx=None, pack_on_start=False):
         _fill_login_curve(login_curve, ac[0]["note"], start_lc, p, start_day, rest_days)
     _fill_login_curve(login_curve, big["note"], big_login_start, p, start_day, rest_days)
 
-    return full_text, rows, sections, actions_by_day, balance_curve, login_curve
+    return full_text, rows, sections, actions_by_day, balance_curve, login_curve, expiry_info
 
 
 def _fill_login_curve(curve, note, start_claimed, p, start_day, rest_days):
@@ -1068,13 +1111,32 @@ class App(tk.Tk):
                       text="方案已到 %d月%d日 结束，请重新生成并采用新方案。" % (pend.month, pend.day),
                       foreground="#c60").pack(anchor="w")
             return
+        # 到期预警：平台优先消耗快到期的秒点（先获得的先扣），到期没用掉会自然流失
+        def _expiry_warnings(day_obj):
+            lines = []
+            for note, batches in (plan.get("expiry_info") or {}).items():
+                for b in batches:
+                    try:
+                        e, a = int(b[1]), float(b[2])
+                        edate = datetime.date(int(plan["year"]), int(plan["month"]), e)
+                    except Exception:
+                        continue
+                    if edate == day_obj:
+                        lines.append("⚠ %s：%g 点今天到期，没用掉今天就流失！" % (note, a))
+                    elif edate == day_obj + datetime.timedelta(days=1):
+                        lines.append("⚠ %s：%g 点明天（%d日）到期，尽快用掉" % (note, a, e))
+            return lines
+
         day_actions = actions.get(str(now.day), {})
-        if not day_actions:
+        warns = _expiry_warnings(now)
+        if not day_actions and not warns:
             ttk.Label(self.today_lines, text="今日无安排（休息日）。", foreground="#666").pack(anchor="w")
             return
         for note, acts in day_actions.items():
             txt = "· %s：%s" % (note, "、".join(acts) if acts else "静默（不登录、不操作）")
             ttk.Label(self.today_lines, text=txt).pack(anchor="w")
+        for w in warns:
+            ttk.Label(self.today_lines, text=w, foreground="#c00").pack(anchor="w")
 
     # ---- 查看当前方案：确保快照里有完整全文（兼容旧方案）----
     def _ensure_plan_text(self, plan):
@@ -1111,7 +1173,7 @@ class App(tk.Tk):
                 "weekday": WEEK_CN[datetime.date(py, pm, ps).weekday()],
                 "today_done": False,
             }
-            text, rows, _secs, _acts, _bal, _login = build_plan(
+            text, rows, _secs, _acts, _bal, _login, _exp = build_plan(
                 restored, p, ctx, pack_on_start=bool(plan.get("packed_on_start", False)))
             plan["text"] = text
             plan["rows"] = rows
@@ -1140,7 +1202,7 @@ class App(tk.Tk):
                 "plan_days": max(1, pe - ps + 1), "rest_days": rest,
                 "weekday": WEEK_CN[plan_start.weekday()], "today_done": False,
             }
-            _text, _rows, _secs, _acts, bal_curve, login_curve = build_plan(
+            _text, _rows, _secs, _acts, bal_curve, login_curve, _exp = build_plan(
                 accounts, p, ctx, pack_on_start=bool(plan.get("packed_on_start", False)))
             plan["balance_curve"] = {str(d): dict(v) for d, v in bal_curve.items()}
             plan["login_curve"] = {str(d): dict(v) for d, v in login_curve.items()}
@@ -1456,7 +1518,7 @@ class App(tk.Tk):
     def on_generate(self):
         try:
             accounts, p = self.collect()
-            text, rows, _sections, actions, balance_curve, login_curve = build_plan(
+            text, rows, _sections, actions, balance_curve, login_curve, expiry = build_plan(
                 accounts, p, self.ctx, pack_on_start=self.pack_today_var.get())
             self.last_rows = rows
             c = self.ctx
@@ -1468,6 +1530,7 @@ class App(tk.Tk):
                 "actions": {str(d): dict(v) for d, v in actions.items()},
                 "balance_curve": {str(d): dict(v) for d, v in balance_curve.items()},
                 "login_curve": {str(d): dict(v) for d, v in login_curve.items()},
+                "expiry_info": {k: [list(b) for b in v] for k, v in expiry.items()},
                 "start_bal": {a["note"]: float(a["balance"]) for a in accounts},
                 "start_login": {a["note"]: int(a.get("login_claimed", 0)) for a in accounts},
                 "login_cap": int(p["login_days_cap"]),
@@ -1578,6 +1641,7 @@ class App(tk.Tk):
         lines.append("【一】当前各号秒点（界面现值 —— 核对基准）")
         lines.append("-" * W)
         cur = {}
+        exp_info = (plan or {}).get("expiry_info") or {}
         for r in getattr(self, "rows", []):
             try:
                 bal = float(r.bal_var.get() or 0)
@@ -1587,6 +1651,13 @@ class App(tk.Tk):
             cur[note] = bal
             mark = "  ⚠负数" if bal < 0 else ""
             lines.append("  %-12s %10s 点%s" % (note, ("%g" % bal), mark))
+            # 附到期批次：平台优先消耗快到期的秒点，到期没用掉就自然流失
+            for b in exp_info.get(note, []):
+                try:
+                    lines.append("      ↳ %g 点（%d日获得）→ %d日 过期"
+                                 % (float(b[2]), int(b[0]), int(b[1])))
+                except Exception:
+                    continue
 
         # ---- 二、方案预期 vs 当前（解释为什么对不上） ----
         lines.append("")

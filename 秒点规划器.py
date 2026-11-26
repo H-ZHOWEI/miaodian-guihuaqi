@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-秒点规划器 v1.12.0
+秒点规划器 v1.12.1
 根据每个账号当前秒点余额，模拟并生成「点赞 / 登录领奖 / 复制转账 / 打包」的执行方案。
 用 Python 3.12 + tkinter，可打包为单文件 exe。
 """
@@ -23,7 +23,7 @@ import datetime
 import calendar
 
 APP_NAME = "秒点规划器"
-VERSION = "1.12.0"
+VERSION = "1.12.1"
 APP_VERSION = VERSION   # 版本更新模块使用
 
 # ===== 内置「版本更新」配置 =====
@@ -371,7 +371,7 @@ DEFAULTS = {
     "like_per_day": 20,     # 每天点赞次数上限
     "login_bonus": 100,     # 每日登录奖励
     "login_days_cap": 7,    # 每月可领登录奖励天数
-    "expiry_days": 15,      # 免费秒点有效期（天）·官方2026-07起为15天，旧版7天已过期
+    "expiry_days": 7,       # 免费秒点有效期（天）·按用户确认以7天为准，可在参数里调整
     "copy_fee_pct": 20,     # 复制手续费百分比（作者实得 = 定价 * (1 - fee%)）
     "backend_projects": 3,  # 大号后端项目数
     "backend_per_day": 20,  # 每个后端项目每天扣费

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-秒点规划器 v1.10.0
+秒点规划器 v1.11.0
 根据每个账号当前秒点余额，模拟并生成「点赞 / 登录领奖 / 复制转账 / 打包」的执行方案。
 用 Python 3.12 + tkinter，可打包为单文件 exe。
 """
@@ -23,7 +23,7 @@ import datetime
 import calendar
 
 APP_NAME = "秒点规划器"
-VERSION = "1.10.0"
+VERSION = "1.11.0"
 APP_VERSION = VERSION   # 版本更新模块使用
 
 # ===== 内置「版本更新」配置 =====
@@ -433,47 +433,52 @@ def simulate_small(ac, p, start_day=1, rest_days=None):
     work_count = max(1, p["work_count"])
     price = p["work_price"]
 
+    def _bal():
+        return round(_total(queue) - debt, 2)
+
     for d in range(start_day, start_day + p["plan_days"]):
+        # 秒点过期是真实发生的余额减少，显式记一笔，保证逐笔账目能跟平台对上
+        before_expire = _total(queue) - debt
         queue = _expire(queue, d, p["expiry_days"])
+        expired = round(before_expire - (_total(queue) - debt), 2)
+        if expired > 0.005:
+            events.append((d, "秒点过期", -expired, _bal()))
         if d in rest_days:
             # 周日：不点赞、不领登录奖、不复制；只记录零收入
-            events.append((d, "周日休息(无收入)", 0, None))
+            events.append((d, "周日休息(无收入)", 0, _bal()))
         else:
             gain = like_gain
-            if login_left > 0:
+            login_flag = login_left > 0
+            if login_flag:
                 gain += p["login_bonus"]
                 login_left -= 1
                 login_granted += 1
-                events.append((d, "登录领奖+点赞", gain, None))
-            else:
-                events.append((d, "点赞", gain, None))
             # 有欠费时，收益先冲抵债务，剩余才入队（队列=可用秒点）
+            pay = 0
             if debt > 0 and gain > 0:
                 pay = min(debt, gain)
                 debt -= pay
                 gain -= pay
-                events.append((d, "偿还欠费", -pay, None))
             if gain > 0:
                 queue.append((d, float(gain)))
+            # 每笔都记录「这笔操作之后」的真实余额，不再全部填成日终值。
+            # 还债是收入的内部去向：合并进文案说明，不单列一笔金额对不上的账。
+            now = _bal()
+            label = "登录领奖+点赞" if login_flag else "点赞"
+            if pay > 0:
+                label += "(其中%g还欠费)" % round(pay, 2)
+            events.append((d, label, round(gain + pay, 2), now))
 
             made = 0
             while price > 0 and _total(queue) >= price:
                 queue = _consume(queue, price)
                 wi = ptr % work_count
                 copies.append((d, wi + 1))
-                events.append((d, "复制→作品%d" % (wi + 1), -price, None))
+                events.append((d, "复制→作品%d" % (wi + 1), -price, _bal()))
                 ptr += 1
                 made += 1
                 if made > 1000:  # 保险
                     break
-
-        bal = _total(queue) - debt
-        # 回填当天所有事件的余额（遇到上一天已填的即停止）
-        for i in range(len(events) - 1, -1, -1):
-            if events[i][3] is None:
-                events[i] = (events[i][0], events[i][1], events[i][2], bal)
-            else:
-                break
 
     author_income = len(copies) * price * (1 - p["copy_fee_pct"] / 100.0)
     return copies, events, author_income, _total(queue) - debt, login_granted
@@ -499,8 +504,16 @@ def simulate_big(ac, p, income_by_day, start_day=1, rest_days=None, pack_on_star
     backend = p["backend_projects"] * p["backend_per_day"]
     pack_cost = p["pack_cost"]
 
+    def _bal():
+        return round(_total(queue) - debt, 2)
+
     for d in range(start_day, start_day + p["plan_days"]):
+        # 秒点过期：真实减少，显式记一笔
+        before_expire = _total(queue) - debt
         queue = _expire(queue, d, p["expiry_days"])
+        expired = round(before_expire - (_total(queue) - debt), 2)
+        if expired > 0.005:
+            events.append((d, "秒点过期", -expired, _bal()))
         is_rest = d in rest_days
         is_first = (d == start_day)
         inc = 0.0 if is_rest else income_by_day.get(d, 0.0)
@@ -513,17 +526,21 @@ def simulate_big(ac, p, income_by_day, start_day=1, rest_days=None, pack_on_star
                 login_granted += 1
         # 收款/点赞先冲抵欠费，剩余才成为可用秒点
         income = day_gain + inc
+        pay = 0.0
         if debt > 0 and income > 0:
             pay = min(debt, income)
             debt -= pay
             income -= pay
-            events.append((d, "偿还欠费", -pay, None))
         if income > 0:
             queue.append((d, float(income)))
+        # 收入事件记原始金额，余额快照为扣债入队后的真实值
         if is_rest:
-            events.append((d, "周日休息(无收款)", 0, None))
+            events.append((d, "周日休息(无收款)", 0, _bal()))
         else:
-            events.append((d, "收款+活跃", day_gain + inc, None))
+            label = "收款+活跃"
+            if pay > 0:
+                label += "(其中%g还欠费)" % round(pay, 2)
+            events.append((d, label, round(day_gain + inc, 2), _bal()))
 
         # 后端扣费：周日照常扣。余额不足时不再停在0，而是形成欠费（负余额）
         avail = _total(queue)
@@ -531,26 +548,19 @@ def simulate_big(ac, p, income_by_day, start_day=1, rest_days=None, pack_on_star
             short = backend - avail
             queue = []
             debt += short
-            events.append((d, "后端扣费(含欠费)", -backend, None))
+            events.append((d, "后端扣费(含欠费)", -backend, _bal()))
         else:
             queue = _consume(queue, backend)
-            events.append((d, "后端扣费", -backend, None))
+            events.append((d, "后端扣费", -backend, _bal()))
 
         # 打包：只按用户勾选在起始日执行一次；之后余额够仅提示、不自动扣
         cur_bal = _total(queue) - debt
         if pack_on_start and is_first and not is_rest and pack_cost > 0 and cur_bal >= pack_cost:
             queue = _consume(queue, pack_cost)
             packs.append(d)
-            events.append((d, "打包(按你勾选)", -pack_cost, None))
+            events.append((d, "打包(按你勾选)", -pack_cost, _bal()))
         elif pack_cost > 0 and cur_bal >= pack_cost:
             packable_days.append(d)
-
-        bal = _total(queue) - debt
-        for i in range(len(events) - 1, -1, -1):
-            if events[i][3] is None:
-                events[i] = (events[i][0], events[i][1], events[i][2], bal)
-            else:
-                break
 
     return packs, events, _total(queue) - debt, login_granted, packable_days
 
@@ -834,6 +844,8 @@ class App(tk.Tk):
         self.pending_plan = None   # 最近生成、尚未确认采用的方案快照
         self.adopted_plan = None   # 已确认采用的方案（持久化，主页面每日展示）
         self.change_log = []       # 实际加减记录（每次推进/回退逐条记，供核对）
+        self.detail_group_var = tk.StringVar(value="day")   # 逐笔核对：按日期 / 按账号
+        self.detail_scope_var = tk.StringVar(value="done")  # 逐笔核对：只看已发生 / 全部
         self.today_done_var = tk.BooleanVar(value=False)  # 今天是否已全部操作过
         self.pack_today_var = tk.BooleanVar(value=False)  # 起始日是否打包
         self.save_status_var = tk.StringVar(value="")
@@ -990,7 +1002,7 @@ class App(tk.Tk):
         self.plan_tip = ttk.LabelFrame(self, text=" 方案 ", padding=8)
         self.plan_tip.pack(fill="x")
         ttk.Label(self.plan_tip,
-                  text="点「生成方案」出新方案；采用后点「查看当前方案」回看完整方案，点「查看加减明细」逐笔核对扣除/增加。负余额如实显示，不会被抹掉。",
+                  text="点「生成方案」出新方案；采用后点「查看当前方案」回看完整方案，点「查看加减明细」按日期/账号逐笔核对。负余额如实显示，不会被抹掉。",
                   foreground="#666").pack(anchor="w")
 
     # ---- 日期栏刷新 ----
@@ -1532,101 +1544,193 @@ class App(tk.Tk):
             self.plan_status_var.set("方案生成时间：%s ｜ 确认采用后主页面每日显示各号操作" %
                                      datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
 
+    def _detail_view_mode(self):
+        """当前逐笔视图设置：(group, scope) = (按日期/按账号, 全部/只看已发生)。"""
+        g = getattr(self, "detail_group_var", None)
+        s = getattr(self, "detail_scope_var", None)
+        return (g.get() if g else "day", s.get() if s else "done")
+
+    def _current_plan_day(self, plan):
+        """方案推进到哪一天（今天/昨天收盘），用于「只看已发生」过滤。"""
+        if not plan:
+            return None
+        try:
+            last = plan.get("last_advance_day")
+            if last is not None:
+                return int(last)
+        except Exception:
+            pass
+        return None
+
     def _build_change_detail_text(self):
-        """组装「加减明细」全文：方案逐笔明细 + 软件实际加减记录 + 核对说明。"""
+        """组装「加减明细」全文：当前余额 → 预期对照 → 逐笔核对 → 实际记录。"""
         lines = []
-        lines.append("=" * 68)
-        lines.append("秒点加减明细（核对每一笔扣除 / 增加）")
+        W = 76
+        lines.append("=" * W)
+        lines.append("秒点加减明细（与平台余额逐笔核对）")
         lines.append("生成时间：%s" % datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-        lines.append("=" * 68)
+        lines.append("=" * W)
 
         plan = getattr(self, "adopted_plan", None) or getattr(self, "pending_plan", None)
-        # ---- 第一部分：方案逐笔明细（原始模拟） ----
-        lines.append("")
-        lines.append("【一】方案逐笔明细（采用方案时算出的每一笔，按日期）")
-        lines.append("-" * 68)
-        rows = None
-        if plan:
-            rows = plan.get("rows")
-        if not rows:
-            rows = getattr(self, "last_rows", None)
-        if not rows:
-            lines.append("（暂无方案明细，请先生成方案）")
-        else:
-            # rows 格式：[日, 角色, 备注, 动作, 变动, 操作后余额]
-            header = rows[0] if rows and isinstance(rows[0], list) else []
-            data = rows[1:] if header and str(header[0]).startswith("日期") else rows
-            grand = 0.0
-            for row in data:
-                try:
-                    day = row[0]
-                    role = row[1]
-                    note = row[2]
-                    action = row[3]
-                    amt = float(row[4])
-                    bal = row[5]
-                except Exception:
-                    continue
-                grand += amt
-                mark = "  ⚠负" if isinstance(bal, (int, float)) and bal < 0 else ""
-                lines.append("  %s日  %-4s %-10s %-18s %+8s  → 余额 %s%s"
-                             % (day, role, note, action, ("%g" % amt), bal, mark))
-            lines.append("-" * 68)
-            lines.append("  方案期内逐笔变动合计：%+g 点（小号复制/点赞、大号收款/后端/打包）" % round(grand, 2))
 
-        # ---- 第二部分：软件实际加减记录（推进/回退时真实改了多少） ----
+        # ---- 一、当前各号秒点（界面现值，核对基准） ----
         lines.append("")
-        lines.append("【二】软件实际加减记录（每日自动推进 / 取消勾选回退时，真实改到余额上的数）")
-        lines.append("-" * 68)
-        log = getattr(self, "change_log", None)
-        if not isinstance(log, list) or not log:
-            lines.append("（暂无实际加减记录。采用方案并跨天 / 勾选「今天已操作」后，这里会逐条记录。）")
-        else:
-            for e in log:
-                try:
-                    lines.append("  %s  %s月%s日  %-10s %+8s 点  %s → %s  [%s]  %s%s"
-                                 % (e.get("ts", ""), plan.get("month", "") if plan else "",
-                                    e.get("day", ""), e.get("note", ""),
-                                    ("%g" % float(e.get("delta", 0))),
-                                    ("%g" % float(e.get("before", 0))),
-                                    ("%g" % float(e.get("after", 0))),
-                                    e.get("direction", ""), e.get("reason", ""),
-                                    "  ⚠负" if float(e.get("after", 0)) < 0 else ""))
-                except Exception:
-                    continue
-            lines.append("-" * 68)
-            lines.append("  共 %d 条记录（保留最近 500 条）。" % len(log))
-
-        # ---- 第三部分：当前各号余额 ----
-        lines.append("")
-        lines.append("【三】当前各号秒点（界面现值）")
-        lines.append("-" * 68)
+        lines.append("【一】当前各号秒点（界面现值 —— 核对基准）")
+        lines.append("-" * W)
+        cur = {}
         for r in getattr(self, "rows", []):
             try:
                 bal = float(r.bal_var.get() or 0)
             except ValueError:
                 bal = 0.0
             note = r.note_var.get().strip() or r.role_var.get()
-            mark = "  ⚠ 负数（后端照扣）" if bal < 0 else ""
-            lines.append("  %-10s %s 点%s" % (note, ("%g" % bal), mark))
+            cur[note] = bal
+            mark = "  ⚠负数" if bal < 0 else ""
+            lines.append("  %-12s %10s 点%s" % (note, ("%g" % bal), mark))
 
+        # ---- 二、方案预期 vs 当前（解释为什么对不上） ----
         lines.append("")
-        lines.append("说明：第一部分是方案当初的模拟值；第二部分是软件真正加到余额上的数")
-        lines.append("（若你手改过余额，两者会不同——这是正常的，软件以你手改的数为基准继续叠加）。")
-        lines.append("如发现某笔加减不对，可对照这两部分定位，并把真实余额填进「当前秒点」。")
+        lines.append("【二】方案预期 vs 当前（为什么数字会不一样）")
+        lines.append("-" * W)
+        if not plan:
+            lines.append("  （尚未采用方案，无可对照的预期值。）")
+        else:
+            py, pm = int(plan["year"]), int(plan["month"])
+            ps, pe = int(plan["start_day"]), int(plan["end_day"])
+            curday = self._current_plan_day(plan)
+            start_bal = plan.get("start_bal", {}) or {}
+            bal_curve = plan.get("balance_curve", {}) or {}
+            lines.append("  方案区间：%d月%d日～%d日 ｜ 采用时间：%s ｜ 推进到：%s" % (
+                pm, ps, pe, plan.get("adopted_at", "—"),
+                ("%d日收盘" % curday) if curday is not None else "起始前"))
+            lines.append("  %-12s %12s %12s %12s" % ("账号", "方案起始", "方案该日预期", "当前实际"))
+            for r in getattr(self, "rows", []):
+                note = r.note_var.get().strip() or r.role_var.get()
+                if note not in start_bal:
+                    continue
+                sb = start_bal.get(note)
+                expect = None
+                if curday is not None:
+                    expect = self._curve_value(bal_curve, curday, note, sb)
+                lines.append("  %-12s %12s %12s %12s" % (
+                    note, ("%g" % float(sb)) if sb is not None else "—",
+                    ("%g" % float(expect)) if expect is not None else "—",
+                    ("%g" % cur.get(note, 0))))
+            lines.append("  说明：软件按「每日增量」推进，你手工改过的余额会作为新基准继续叠加，")
+            lines.append("        所以当前值常与方案模拟值不同；这是正常的，以【一】当前值为准。")
+            if curday is None:
+                lines.append("  ⚠ 方案推进标记为「起始前」：当前值就是你填的起始余额，方案当天动作尚未计入。")
+        rows = (plan.get("rows") if plan else None) or getattr(self, "last_rows", None)
+        data = []
+        if rows:
+            header = rows[0] if rows and isinstance(rows[0], list) else []
+            data = rows[1:] if header and str(header[0]).startswith("日期") else rows
+
+        # ---- 三、逐笔核对表（可切换按日期/账号分组、只看已发生/全部） ----
+        lines.append("")
+        group, scope = self._detail_view_mode()
+        scope_txt = "只看已发生" if scope == "done" else "全部（含未发生）"
+        lines.append("【三】方案逐笔核对（%s / %s）" %
+                     ("按日期分组" if group == "day" else "按账号分组", scope_txt))
+        lines.append("-" * W)
+        if not data:
+            lines.append("  （暂无方案明细，请先生成方案。）")
+        else:
+            curday = self._current_plan_day(plan)
+            if scope == "done" and curday is not None:
+                shown = [r for r in data if int(r[0]) <= curday]
+            elif scope == "done":
+                shown = []
+            else:
+                shown = data
+            if not shown:
+                lines.append("  （方案当天动作尚未计入；点「全部(含未发生)」可查看完整计划。）")
+            else:
+                # 从方案起始余额逐笔重算余额链：旧快照里存的余额是「日终回填」的坏值，
+                # 直接用每笔「变动」累加才能给出「上笔→变动→本笔」自洽的一串数。
+                start_bal = (plan.get("start_bal", {}) or {}) if plan else {}
+                running = {}
+                def _base(note, fallback):
+                    if note in running:
+                        return running[note]
+                    return float(start_bal.get(note, fallback))
+                if group == "day":
+                    by_day = {}
+                    for row in shown:
+                        by_day.setdefault(int(row[0]), []).append(row)
+                    for d in sorted(by_day):
+                        acts = (plan.get("actions", {}) or {}).get(str(d), {}) if plan else {}
+                        tag = "  ★周日休息日" if any("静默" in a for a in acts.values()) else ""
+                        lines.append("  ── %d日%s" % (d, tag))
+                        for row in by_day[d]:
+                            role, note, action, amt = row[1], row[2], row[3], float(row[4])
+                            base = _base(note, float(row[5]) - amt)
+                            bal = round(base + amt, 2)
+                            running[note] = bal
+                            mark = "  ⚠负" if bal < 0 else ""
+                            lines.append("     %-4s %-10s %-22s %-26s%s" %
+                                         (role, note, action,
+                                          "%s → %+g → %s" % ("%g" % base, amt, "%g" % bal), mark))
+                else:
+                    by_note = {}
+                    for row in shown:
+                        by_note.setdefault(row[2], []).append(row)
+                    for note in sorted(by_note):
+                        lines.append("  ── %s" % note)
+                        base = float(start_bal.get(note, 0)) if plan else 0.0
+                        for row in sorted(by_note[note], key=lambda x: int(x[0])):
+                            day, amt = int(row[0]), float(row[4])
+                            bal = round(base + amt, 2)
+                            mark = "  ⚠负" if bal < 0 else ""
+                            lines.append("     %2d日 %-22s %-26s%s" %
+                                         (day, row[3],
+                                          "%s → %+g → %s" % ("%g" % base, amt, "%g" % bal), mark))
+                            base = bal
+
+        # ---- 四、实际加减记录（推进/回退时真实改了多少） ----
+        lines.append("")
+        lines.append("【四】软件实际加减记录（每日推进 / 取消勾选回退时真实改到余额上的数）")
+        lines.append("-" * W)
+        log = getattr(self, "change_log", None)
+        if not isinstance(log, list) or not log:
+            lines.append("  （暂无记录。采用方案后跨天，或勾选/取消「今天已操作」，这里会逐条记录。）")
+            lines.append("  提示：旧版本采用或手工填写的余额没有逐笔记录，属正常现象。")
+        else:
+            for e in log[-80:]:
+                try:
+                    lines.append("  %s  %s月%s日  %-10s %+8s 点  %s → %s  [%s]  %s%s" % (
+                        e.get("ts", ""), plan.get("month", "") if plan else "",
+                        e.get("day", ""), e.get("note", ""),
+                        ("%g" % float(e.get("delta", 0))),
+                        ("%g" % float(e.get("before", 0))),
+                        ("%g" % float(e.get("after", 0))),
+                        e.get("direction", ""), e.get("reason", ""),
+                        "  ⚠负" if float(e.get("after", 0)) < 0 else ""))
+                except Exception:
+                    continue
+            lines.append("  （仅显示最近 80 条，共 %d 条存档。）" % len(log))
+        lines.append("")
+        lines.append("核对方法：先看【一】当前值是否与平台一致；不一致时对照【二】找原因，")
+        lines.append("再用【三】逐笔「上笔→变动→本笔」定位哪一笔，最后用【四】看软件实际改了多少。")
         return "\n".join(lines)
+
+    def _refresh_detail_text(self, *args):
+        """视图切换后重绘明细全文。"""
+        txt = getattr(self, "detail_text", None)
+        if txt is None:
+            return
+        txt.configure(state="normal")
+        txt.delete("1.0", "end")
+        txt.insert("1.0", self._build_change_detail_text())
+        txt.configure(state="disabled")
+        txt.yview_moveto(0)
 
     def on_view_changes(self):
         """独立窗口展示每笔扣除/增加明细，供用户核对是否有加减错误。"""
         text = self._build_change_detail_text()
         win = getattr(self, "detail_win", None)
         if win is not None and win.winfo_exists():
-            w = self.detail_text
-            w.configure(state="normal")
-            w.delete("1.0", "end")
-            w.insert("1.0", text)
-            w.configure(state="disabled")
-            w.yview_moveto(0)
+            self._refresh_detail_text()
             win.lift()
             win.focus_set()
             return
@@ -1634,16 +1738,28 @@ class App(tk.Tk):
         win = tk.Toplevel(self)
         self.detail_win = win
         win.title("加减明细 - %s" % APP_NAME)
-        win.geometry("1000x800")
-        win.minsize(720, 520)
+        win.geometry("1060x820")
+        win.minsize(760, 560)
 
         bar = ttk.Frame(win, padding=(10, 8))
         bar.pack(fill="x")
-        ttk.Label(bar, text="每笔扣除/增加明细，可与平台余额逐笔核对",
-                  foreground="#0a6").pack(side="left")
+        ttk.Label(bar, text="与平台余额逐笔核对", foreground="#0a6").pack(side="left")
         ttk.Button(bar, text="关闭", command=self._close_detail).pack(side="right", padx=3)
         ttk.Button(bar, text="复制全文", command=self._copy_detail).pack(side="right", padx=3)
         ttk.Button(bar, text="导出明细CSV", command=self.on_export).pack(side="right", padx=3)
+
+        # 视图切换工具条：分组方式 / 是否已发生，切换即重绘
+        tools = ttk.Frame(win, padding=(10, 0, 10, 6))
+        tools.pack(fill="x")
+        ttk.Label(tools, text="逐笔视图：").pack(side="left")
+        ttk.Radiobutton(tools, text="按日期", value="day", variable=self.detail_group_var,
+                        command=self._refresh_detail_text).pack(side="left")
+        ttk.Radiobutton(tools, text="按账号", value="note", variable=self.detail_group_var,
+                        command=self._refresh_detail_text).pack(side="left", padx=(2, 12))
+        ttk.Radiobutton(tools, text="只看已发生", value="done", variable=self.detail_scope_var,
+                        command=self._refresh_detail_text).pack(side="left")
+        ttk.Radiobutton(tools, text="全部(含未发生)", value="all", variable=self.detail_scope_var,
+                        command=self._refresh_detail_text).pack(side="left")
 
         body = ttk.Frame(win, padding=(10, 0, 10, 10))
         body.pack(fill="both", expand=True)

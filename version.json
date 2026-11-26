@@ -1,9 +1,9 @@
 {
-  "version": "1.10.0",
+  "version": "1.11.0",
   "download_url": "https://raw.githubusercontent.com/H-ZHOWEI/miaodian-guihuaqi/main/dist/%E7%A7%92%E7%82%B9%E8%A7%84%E5%88%92%E5%99%A8.exe",
-  "notes": "负数如实处理（欠费不被抹成 0、后端照扣可显示负余额）；新增「查看加减明细」窗口逐笔核对扣除与增加。",
-  "sha256": "73db45608b46e00c7c1330fe9c1ed2b7fc5f8ffab0d305516c744797ad311cf5",
-  "size": 10968817,
+  "notes": "重构「查看加减明细」为四段式（当前秒点/预期对比/逐笔核对/实际记录），修复同一天多笔余额被填成同一个日终值导致账目对不上的问题，逐笔真实自洽，可切换按日期或账号、只看已发生或全部。",
+  "sha256": "af071669ba6c4385e6a9dcb0880fc20683d5bde6be384a67797e82c95b925cea",
+  "size": 10974166,
   "pub_date": "2026-11-26",
   "mandatory": false
 }

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-秒点规划器 v1.9.4
+秒点规划器 v1.10.0
 根据每个账号当前秒点余额，模拟并生成「点赞 / 登录领奖 / 复制转账 / 打包」的执行方案。
 用 Python 3.12 + tkinter，可打包为单文件 exe。
 """
@@ -23,7 +23,7 @@ import datetime
 import calendar
 
 APP_NAME = "秒点规划器"
-VERSION = "1.9.4"
+VERSION = "1.10.0"
 APP_VERSION = VERSION   # 版本更新模块使用
 
 # ===== 内置「版本更新」配置 =====
@@ -424,6 +424,8 @@ def simulate_small(ac, p, start_day=1, rest_days=None):
     like_gain = p["like_gain"] * p["like_per_day"]
     login_left = max(0, p["login_days_cap"] - int(ac.get("login_claimed", 0)))
     login_granted = 0  # 方案窗口内实际领到的登录奖励次数
+    # 负余额=欠费：如实记为债务，后续收益须先偿还，不能用「从0开始」抹掉
+    debt = max(0.0, -float(ac.get("balance", 0)))
     queue = [(start_day, float(ac["balance"]))] if ac["balance"] > 0 else []
     copies = []       # (day, work_index_1based)
     events = []       # 每日事件 list of (day, action, amount, balance)
@@ -445,6 +447,12 @@ def simulate_small(ac, p, start_day=1, rest_days=None):
                 events.append((d, "登录领奖+点赞", gain, None))
             else:
                 events.append((d, "点赞", gain, None))
+            # 有欠费时，收益先冲抵债务，剩余才入队（队列=可用秒点）
+            if debt > 0 and gain > 0:
+                pay = min(debt, gain)
+                debt -= pay
+                gain -= pay
+                events.append((d, "偿还欠费", -pay, None))
             if gain > 0:
                 queue.append((d, float(gain)))
 
@@ -459,7 +467,7 @@ def simulate_small(ac, p, start_day=1, rest_days=None):
                 if made > 1000:  # 保险
                     break
 
-        bal = _total(queue)
+        bal = _total(queue) - debt
         # 回填当天所有事件的余额（遇到上一天已填的即停止）
         for i in range(len(events) - 1, -1, -1):
             if events[i][3] is None:
@@ -468,7 +476,7 @@ def simulate_small(ac, p, start_day=1, rest_days=None):
                 break
 
     author_income = len(copies) * price * (1 - p["copy_fee_pct"] / 100.0)
-    return copies, events, author_income, _total(queue), login_granted
+    return copies, events, author_income, _total(queue) - debt, login_granted
 
 
 def simulate_big(ac, p, income_by_day, start_day=1, rest_days=None, pack_on_start=False):
@@ -482,6 +490,8 @@ def simulate_big(ac, p, income_by_day, start_day=1, rest_days=None, pack_on_star
     like_gain = p["like_gain"] * p["like_per_day"]
     login_left = max(0, p["login_days_cap"] - int(ac.get("login_claimed", 0)))
     login_granted = 0  # 方案窗口内实际领到的登录奖励次数
+    # 负余额=欠费：后端照扣造成的欠费如实保留，收款先还债
+    debt = max(0.0, -float(ac.get("balance", 0)))
     queue = [(start_day, float(ac["balance"]))] if ac["balance"] > 0 else []
     packs = []
     events = []
@@ -501,35 +511,48 @@ def simulate_big(ac, p, income_by_day, start_day=1, rest_days=None, pack_on_star
                 day_gain += p["login_bonus"]
                 login_left -= 1
                 login_granted += 1
-        if day_gain > 0:
-            queue.append((d, float(day_gain)))
-        if inc > 0:
-            queue.append((d, float(inc)))
+        # 收款/点赞先冲抵欠费，剩余才成为可用秒点
+        income = day_gain + inc
+        if debt > 0 and income > 0:
+            pay = min(debt, income)
+            debt -= pay
+            income -= pay
+            events.append((d, "偿还欠费", -pay, None))
+        if income > 0:
+            queue.append((d, float(income)))
         if is_rest:
             events.append((d, "周日休息(无收款)", 0, None))
         else:
             events.append((d, "收款+活跃", day_gain + inc, None))
 
-        # 后端扣费：周日照常扣
-        queue = _consume(queue, backend)
-        events.append((d, "后端扣费", -backend, None))
+        # 后端扣费：周日照常扣。余额不足时不再停在0，而是形成欠费（负余额）
+        avail = _total(queue)
+        if backend > avail:
+            short = backend - avail
+            queue = []
+            debt += short
+            events.append((d, "后端扣费(含欠费)", -backend, None))
+        else:
+            queue = _consume(queue, backend)
+            events.append((d, "后端扣费", -backend, None))
 
         # 打包：只按用户勾选在起始日执行一次；之后余额够仅提示、不自动扣
-        if pack_on_start and is_first and not is_rest and pack_cost > 0 and _total(queue) >= pack_cost:
+        cur_bal = _total(queue) - debt
+        if pack_on_start and is_first and not is_rest and pack_cost > 0 and cur_bal >= pack_cost:
             queue = _consume(queue, pack_cost)
             packs.append(d)
             events.append((d, "打包(按你勾选)", -pack_cost, None))
-        elif pack_cost > 0 and _total(queue) >= pack_cost:
+        elif pack_cost > 0 and cur_bal >= pack_cost:
             packable_days.append(d)
 
-        bal = _total(queue)
+        bal = _total(queue) - debt
         for i in range(len(events) - 1, -1, -1):
             if events[i][3] is None:
                 events[i] = (events[i][0], events[i][1], events[i][2], bal)
             else:
                 break
 
-    return packs, events, _total(queue), login_granted, packable_days
+    return packs, events, _total(queue) - debt, login_granted, packable_days
 
 
 def build_plan(accounts, p, ctx=None, pack_on_start=False):
@@ -810,6 +833,7 @@ class App(tk.Tk):
         self.last_rows = None
         self.pending_plan = None   # 最近生成、尚未确认采用的方案快照
         self.adopted_plan = None   # 已确认采用的方案（持久化，主页面每日展示）
+        self.change_log = []       # 实际加减记录（每次推进/回退逐条记，供核对）
         self.today_done_var = tk.BooleanVar(value=False)  # 今天是否已全部操作过
         self.pack_today_var = tk.BooleanVar(value=False)  # 起始日是否打包
         self.save_status_var = tk.StringVar(value="")
@@ -958,14 +982,15 @@ class App(tk.Tk):
         op.pack(fill="x", pady=10)
         ttk.Button(op, text="生成方案", command=self.on_generate).pack(side="left")
         ttk.Button(op, text="查看当前方案", command=self.on_view_current).pack(side="left", padx=6)
-        ttk.Button(op, text="导出明细CSV", command=self.on_export).pack(side="left")
+        ttk.Button(op, text="查看加减明细", command=self.on_view_changes).pack(side="left")
+        ttk.Button(op, text="导出明细CSV", command=self.on_export).pack(side="left", padx=6)
         ttk.Label(op, textvariable=self.save_status_var, foreground="#0a6").pack(side="left", padx=6)
 
         # 方案不在主窗口拆分：生成后在独立窗口以单一页面完整展示
         self.plan_tip = ttk.LabelFrame(self, text=" 方案 ", padding=8)
         self.plan_tip.pack(fill="x")
         ttk.Label(self.plan_tip,
-                  text="点「生成方案」出新方案；采用后点「查看当前方案」随时回看。完整方案在独立窗口单页显示，可复制全文、导出 CSV。",
+                  text="点「生成方案」出新方案；采用后点「查看当前方案」回看完整方案，点「查看加减明细」逐笔核对扣除/增加。负余额如实显示，不会被抹掉。",
                   foreground="#666").pack(anchor="w")
 
     # ---- 日期栏刷新 ----
@@ -1205,6 +1230,8 @@ class App(tk.Tk):
             return int(round(self._curve_value(login_curve, d, note, fb)))
 
         changed = False
+        log_entries = []
+        direction = "回退" if target < last else "推进"
         self._binding_saves = True
         try:
             for r in self.rows:
@@ -1212,26 +1239,42 @@ class App(tk.Tk):
                 if not note or note not in start_bal:
                     continue  # 新增/改名的号不在方案内，跳过
                 delta = bval(target, tgt_eod, note) - bval(last, prev_eod, note)
-                if abs(delta) > 0.005:
-                    try:
-                        cur = float(r.bal_var.get() or 0)
-                    except ValueError:
-                        cur = 0.0
-                    newv = round(cur + delta, 2)
-                    if newv >= 0:   # 余额扣成负数说明曲线异常，放弃这一号
-                        r.bal_var.set("%g" % newv)
-                        changed = True
+                try:
+                    cur = float(r.bal_var.get() or 0)
+                except ValueError:
+                    cur = 0.0
                 # 登录天数按同样增量推进/回退
                 ldelta = lval(target, tgt_eod, note) - lval(last, prev_eod, note)
+                try:
+                    lcur = int(r.login_var.get() or 0)
+                except ValueError:
+                    lcur = 0
+                mdelta = 0.0
+                mlogin = 0
+                if abs(delta) > 0.005:
+                    # 允许余额为负并如实显示：平台后端照扣，扣超了就是欠费，
+                    # 旧版「扣成负数就跳过该号」会让余额卡住不动，反而对不上账。
+                    newv = round(cur + delta, 2)
+                    r.bal_var.set("%g" % newv)
+                    mdelta = round(delta, 2)
+                    changed = True
                 if ldelta:
-                    try:
-                        lcur = int(r.login_var.get() or 0)
-                    except ValueError:
-                        lcur = 0
                     lnew = max(0, min(cap, lcur + ldelta))
                     if lnew != lcur:
                         r.login_var.set(str(lnew))
+                        mlogin = lnew - lcur
                         changed = True
+                if mdelta or mlogin:
+                    acts = (plan.get("actions", {}).get(str(target), {}) or {}).get(note, [])
+                    log_entries.append({
+                        "ts": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "day": int(target), "note": note,
+                        "delta": mdelta, "before": round(cur, 2),
+                        "after": round(cur + mdelta, 2),
+                        "login_delta": mlogin,
+                        "reason": "、".join(acts) if acts else direction,
+                        "direction": direction,
+                    })
         finally:
             self._binding_saves = False
 
@@ -1240,10 +1283,31 @@ class App(tk.Tk):
             plan["eod_marker"] = False
         elif tgt_eod or last > ps:
             plan["eod_marker"] = True
+        if log_entries:
+            self._append_change_log(log_entries)
         self._auto_save()   # 推进日期必须落盘，避免重启后重复叠加同一段增量
         self._set_balance_sync_note(plan, target, unchanged=not changed,
                                     rolled_back=target < last)
         return changed
+
+    def _append_change_log(self, entries):
+        """把本次实际加减追加到记录（保留最近 500 条，避免无限增长）。"""
+        log = getattr(self, "change_log", None)
+        if not isinstance(log, list):
+            log = []
+        log.extend(entries)
+        self.change_log = log[-500:]
+
+    def _negative_notes(self):
+        """返回当前余额为负的账号备注列表。"""
+        out = []
+        for r in getattr(self, "rows", []):
+            try:
+                if float(r.bal_var.get() or 0) < 0:
+                    out.append(r.note_var.get().strip())
+            except ValueError:
+                pass
+        return out
 
     def _set_balance_sync_note(self, plan, target, unchanged=False, rolled_back=False):
         try:
@@ -1266,10 +1330,13 @@ class App(tk.Tk):
                         and (today.year, today.month) == (py, pm)
                         and today.day == target + 1):
                     msg += "今天(%d月%d日)还没勾「今天各号已全部操作过」，操作完勾上即推进到今天。"
-                    self.balance_sync_var.set(
-                        msg % (word, pm, target, pm, today.day))
+                    text = msg % (word, pm, target, pm, today.day)
                 else:
-                    self.balance_sync_var.set(msg % (word, pm, target))
+                    text = msg % (word, pm, target)
+                neg = self._negative_notes()
+                if neg:
+                    text += " ⚠ %s 已为负数（后端照扣所致），负数会如实显示；点「查看加减明细」核对每笔。" % "、".join(neg)
+                self.balance_sync_var.set(text)
         except Exception:
             pass
 
@@ -1465,6 +1532,149 @@ class App(tk.Tk):
             self.plan_status_var.set("方案生成时间：%s ｜ 确认采用后主页面每日显示各号操作" %
                                      datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
 
+    def _build_change_detail_text(self):
+        """组装「加减明细」全文：方案逐笔明细 + 软件实际加减记录 + 核对说明。"""
+        lines = []
+        lines.append("=" * 68)
+        lines.append("秒点加减明细（核对每一笔扣除 / 增加）")
+        lines.append("生成时间：%s" % datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        lines.append("=" * 68)
+
+        plan = getattr(self, "adopted_plan", None) or getattr(self, "pending_plan", None)
+        # ---- 第一部分：方案逐笔明细（原始模拟） ----
+        lines.append("")
+        lines.append("【一】方案逐笔明细（采用方案时算出的每一笔，按日期）")
+        lines.append("-" * 68)
+        rows = None
+        if plan:
+            rows = plan.get("rows")
+        if not rows:
+            rows = getattr(self, "last_rows", None)
+        if not rows:
+            lines.append("（暂无方案明细，请先生成方案）")
+        else:
+            # rows 格式：[日, 角色, 备注, 动作, 变动, 操作后余额]
+            header = rows[0] if rows and isinstance(rows[0], list) else []
+            data = rows[1:] if header and str(header[0]).startswith("日期") else rows
+            grand = 0.0
+            for row in data:
+                try:
+                    day = row[0]
+                    role = row[1]
+                    note = row[2]
+                    action = row[3]
+                    amt = float(row[4])
+                    bal = row[5]
+                except Exception:
+                    continue
+                grand += amt
+                mark = "  ⚠负" if isinstance(bal, (int, float)) and bal < 0 else ""
+                lines.append("  %s日  %-4s %-10s %-18s %+8s  → 余额 %s%s"
+                             % (day, role, note, action, ("%g" % amt), bal, mark))
+            lines.append("-" * 68)
+            lines.append("  方案期内逐笔变动合计：%+g 点（小号复制/点赞、大号收款/后端/打包）" % round(grand, 2))
+
+        # ---- 第二部分：软件实际加减记录（推进/回退时真实改了多少） ----
+        lines.append("")
+        lines.append("【二】软件实际加减记录（每日自动推进 / 取消勾选回退时，真实改到余额上的数）")
+        lines.append("-" * 68)
+        log = getattr(self, "change_log", None)
+        if not isinstance(log, list) or not log:
+            lines.append("（暂无实际加减记录。采用方案并跨天 / 勾选「今天已操作」后，这里会逐条记录。）")
+        else:
+            for e in log:
+                try:
+                    lines.append("  %s  %s月%s日  %-10s %+8s 点  %s → %s  [%s]  %s%s"
+                                 % (e.get("ts", ""), plan.get("month", "") if plan else "",
+                                    e.get("day", ""), e.get("note", ""),
+                                    ("%g" % float(e.get("delta", 0))),
+                                    ("%g" % float(e.get("before", 0))),
+                                    ("%g" % float(e.get("after", 0))),
+                                    e.get("direction", ""), e.get("reason", ""),
+                                    "  ⚠负" if float(e.get("after", 0)) < 0 else ""))
+                except Exception:
+                    continue
+            lines.append("-" * 68)
+            lines.append("  共 %d 条记录（保留最近 500 条）。" % len(log))
+
+        # ---- 第三部分：当前各号余额 ----
+        lines.append("")
+        lines.append("【三】当前各号秒点（界面现值）")
+        lines.append("-" * 68)
+        for r in getattr(self, "rows", []):
+            try:
+                bal = float(r.bal_var.get() or 0)
+            except ValueError:
+                bal = 0.0
+            note = r.note_var.get().strip() or r.role_var.get()
+            mark = "  ⚠ 负数（后端照扣）" if bal < 0 else ""
+            lines.append("  %-10s %s 点%s" % (note, ("%g" % bal), mark))
+
+        lines.append("")
+        lines.append("说明：第一部分是方案当初的模拟值；第二部分是软件真正加到余额上的数")
+        lines.append("（若你手改过余额，两者会不同——这是正常的，软件以你手改的数为基准继续叠加）。")
+        lines.append("如发现某笔加减不对，可对照这两部分定位，并把真实余额填进「当前秒点」。")
+        return "\n".join(lines)
+
+    def on_view_changes(self):
+        """独立窗口展示每笔扣除/增加明细，供用户核对是否有加减错误。"""
+        text = self._build_change_detail_text()
+        win = getattr(self, "detail_win", None)
+        if win is not None and win.winfo_exists():
+            w = self.detail_text
+            w.configure(state="normal")
+            w.delete("1.0", "end")
+            w.insert("1.0", text)
+            w.configure(state="disabled")
+            w.yview_moveto(0)
+            win.lift()
+            win.focus_set()
+            return
+
+        win = tk.Toplevel(self)
+        self.detail_win = win
+        win.title("加减明细 - %s" % APP_NAME)
+        win.geometry("1000x800")
+        win.minsize(720, 520)
+
+        bar = ttk.Frame(win, padding=(10, 8))
+        bar.pack(fill="x")
+        ttk.Label(bar, text="每笔扣除/增加明细，可与平台余额逐笔核对",
+                  foreground="#0a6").pack(side="left")
+        ttk.Button(bar, text="关闭", command=self._close_detail).pack(side="right", padx=3)
+        ttk.Button(bar, text="复制全文", command=self._copy_detail).pack(side="right", padx=3)
+        ttk.Button(bar, text="导出明细CSV", command=self.on_export).pack(side="right", padx=3)
+
+        body = ttk.Frame(win, padding=(10, 0, 10, 10))
+        body.pack(fill="both", expand=True)
+        txt = scrolledtext.ScrolledText(body, wrap="none", font=("Consolas", 10),
+                                        padx=12, pady=10)
+        txt.pack(fill="both", expand=True)
+        txt.insert("1.0", text)
+        txt.configure(state="disabled")
+        self.detail_text = txt
+        win.protocol("WM_DELETE_WINDOW", self._close_detail)
+        win.after(80, lambda: (win.lift(), win.focus_set()))
+
+    def _copy_detail(self):
+        w = getattr(self, "detail_text", None)
+        if w is None:
+            return
+        txt = w.get("1.0", "end-1c")
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(txt)
+            messagebox.showinfo("已复制", "加减明细全文已复制到剪贴板。", parent=self.detail_win)
+        except Exception:
+            pass
+
+    def _close_detail(self):
+        win = getattr(self, "detail_win", None)
+        if win is not None and win.winfo_exists():
+            win.destroy()
+        self.detail_win = None
+        self.detail_text = None
+
     def on_view_current(self):
         """随时回看已采用的完整方案，不必重新生成（重新生成会基于当前余额，是另一份方案）。"""
         plan = getattr(self, "adopted_plan", None)
@@ -1576,6 +1786,7 @@ class App(tk.Tk):
         data["today_done"] = bool(self.today_done_var.get())
         data["pack_today"] = bool(self.pack_today_var.get())
         data["adopted_plan"] = getattr(self, "adopted_plan", None)
+        data["change_log"] = getattr(self, "change_log", [])
         try:
             with open(self.config_path(), "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
@@ -1622,6 +1833,9 @@ class App(tk.Tk):
         # 恢复两个执行状态开关
         self.today_done_var.set(bool(data.get("today_done", False)))
         self.pack_today_var.set(bool(data.get("pack_today", False)))
+        # 恢复实际加减记录（供「查看加减明细」核对，兼容旧配置缺字段）
+        log = data.get("change_log", [])
+        self.change_log = log if isinstance(log, list) else []
         self._refresh_date_bar()
 
     def _auto_load(self):

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-秒点规划器 v1.12.2
+秒点规划器 v1.13.0
 根据每个账号当前秒点余额，模拟并生成「点赞 / 登录领奖 / 复制转账 / 打包」的执行方案。
 用 Python 3.12 + tkinter，可打包为单文件 exe。
 """
@@ -25,7 +25,7 @@ import datetime
 import calendar
 
 APP_NAME = "秒点规划器"
-VERSION = "1.12.2"
+VERSION = "1.13.0"
 APP_VERSION = VERSION   # 版本更新模块使用
 
 # ===== 内置「版本更新」配置 =====
@@ -1021,6 +1021,13 @@ class App(tk.Tk):
         ttk.Label(self, textvariable=self.rest_var, foreground="#c60",
                   font=("Microsoft YaHei", 10)).pack(anchor="w", pady=(0, 6))
 
+        # 一眼速览：把原本要点按钮/切窗口才看得到的关键信息主动摊在主界面
+        ov = ttk.LabelFrame(self, text=" 一眼速览（自动更新） ", padding=6)
+        ov.pack(fill="x", pady=(0, 6))
+        self.overview_var = tk.StringVar(value="")
+        ttk.Label(ov, textvariable=self.overview_var, foreground="#184",
+                  wraplength=900, justify="left").pack(anchor="w")
+
         # 今日执行面板：确认采用方案后，每天自动显示各号该做什么
         self.today_frame = ttk.LabelFrame(self, text=" 今日执行（每天自动更新） ", padding=6)
         self.today_frame.pack(fill="x", pady=(0, 6))
@@ -1074,8 +1081,9 @@ class App(tk.Tk):
         # 操作按钮
         op = ttk.Frame(self)
         op.pack(fill="x", pady=10)
-        ttk.Button(op, text="生成方案", command=self.on_generate).pack(side="left")
-        ttk.Button(op, text="查看当前方案", command=self.on_view_current).pack(side="left", padx=6)
+        ttk.Button(op, text="一键生成并采用", command=self.on_quick_adopt).pack(side="left")
+        ttk.Button(op, text="生成方案（先看再采用）", command=self.on_generate).pack(side="left", padx=6)
+        ttk.Button(op, text="查看当前方案", command=self.on_view_current).pack(side="left")
         ttk.Button(op, text="查看加减明细", command=self.on_view_changes).pack(side="left")
         ttk.Button(op, text="导出明细CSV", command=self.on_export).pack(side="left", padx=6)
         ttk.Label(op, textvariable=self.save_status_var, foreground="#0a6").pack(side="left", padx=6)
@@ -1084,7 +1092,7 @@ class App(tk.Tk):
         self.plan_tip = ttk.LabelFrame(self, text=" 方案 ", padding=8)
         self.plan_tip.pack(fill="x")
         ttk.Label(self.plan_tip,
-                  text="点「生成方案」出新方案；采用后点「查看当前方案」回看完整方案，点「查看加减明细」按日期/账号逐笔核对。负余额如实显示，不会被抹掉。",
+                  text="最省事：点「一键生成并采用」即可。要看细项不用重新生成——点「查看当前方案」回看全文，点「查看加减明细」按日期/账号逐笔核对。负余额如实显示，不会被抹掉。",
                   foreground="#666").pack(anchor="w")
 
     # ---- 日期栏刷新 ----
@@ -1105,8 +1113,137 @@ class App(tk.Tk):
         if hasattr(self, "param_vars") and "plan_days" in self.param_vars:
             self.param_vars["plan_days"].set(str(c["plan_days"]))
 
+    def _refresh_overview(self):
+        """一眼速览：自动汇总今日变动、近期到期、打包机会、负余额等，省去反复点窗口。"""
+        if not hasattr(self, "overview_var"):
+            return
+        plan = getattr(self, "adopted_plan", None)
+        if not plan:
+            self.overview_var.set(
+                "尚未采用方案：填好各号当前秒点后点「一键生成并采用」，"
+                "主界面就会自动显示今日该做什么、何时到期、何时能打包。")
+            return
+        try:
+            y, m = int(plan["year"]), int(plan["month"])
+            ps, pe = int(plan["start_day"]), int(plan["end_day"])
+            dim = calendar.monthrange(y, m)[1]
+        except Exception:
+            self.overview_var.set("方案数据异常，请点「一键生成并采用」重新生成。")
+            return
+
+        parts = []
+        curday = self._current_plan_day(plan)
+        # 方案进度
+        if curday is None or curday < ps:
+            parts.append("方案：%d月%d日～%d日（尚未开始，共 %d 天）" % (m, ps, pe, pe - ps + 1))
+        elif curday > pe:
+            parts.append("方案：%d月%d日～%d日（已结束，请重新生成）" % (m, ps, pe))
+        else:
+            parts.append("方案：%d月%d日～%d日，今日第 %d/%d 天，剩 %d 天"
+                         % (m, ps, pe, curday, pe, max(0, pe - curday + 1)))
+
+        # 今日按方案净变动（余额曲线今日值 - 前一日值；首日与起始余额比）
+        bmap = plan.get("balance_curve") or {}
+        if curday is not None:
+            prev = str(int(curday) - 1)
+            delta_sum = 0.0
+            got = False
+            for note, v in (bmap.get(str(curday)) or {}).items():
+                base = (bmap.get(prev) or {}).get(note,
+                        (plan.get("start_bal") or {}).get(note, v))
+                try:
+                    delta_sum += float(v) - float(base)
+                    got = True
+                except Exception:
+                    pass
+            if got:
+                parts.append("今日按方案净变动 %+g 点" % round(delta_sum, 2))
+
+        # 7 天内到期：按真实日期分组，跨月自动显示下个月
+        today = datetime.date.today()
+        due = {}
+        for note, batches in (plan.get("expiry_info") or {}).items():
+            for b in batches:
+                try:
+                    e, a = int(b[1]), float(b[2])
+                    if e <= dim:
+                        edate = datetime.date(y, m, e)
+                    else:
+                        y2, m2 = (y + 1, 1) if m == 12 else (y, m + 1)
+                        edate = datetime.date(y2, m2, e - dim)
+                    left = (edate - today).days
+                    if 0 <= left <= 7:
+                        due.setdefault(edate, []).append((note, a))
+                except Exception:
+                    continue
+        if due:
+            chunks = []
+            for edate in sorted(due)[:2]:
+                items = "、".join("%s %g点" % (n, a) for n, a in due[edate])
+                chunks.append("%d月%d日 %s" % (edate.month, edate.day, items))
+            parts.append("⚠ 7天内到期：" + "；".join(chunks) + "（没用掉会流失）")
+        else:
+            parts.append("7天内无秒点到期")
+
+        # 打包机会：大号日终余额首次达到打包线的日期
+        big_note = None
+        for r in getattr(self, "rows", []):
+            if getattr(r, "role", "") == "big":
+                big_note = r.note_var.get().strip() or r.role_var.get()
+                break
+        pack_cost = 0.0
+        for key in ("pack_cost",):
+            try:
+                pack_cost = float((self.param_vars[key].get() or 0) if hasattr(self, "param_vars")
+                                  and key in self.param_vars else 0)
+            except Exception:
+                pass
+        pack_day = None
+        if big_note and pack_cost > 0:
+            for d in sorted(bmap, key=lambda x: int(x)):
+                if curday is not None and int(d) < int(curday):
+                    continue
+                try:
+                    if float((bmap[d] or {})[big_note]) >= pack_cost:
+                        pack_day = (int(d), float(bmap[d][big_note]))
+                        break
+                except Exception:
+                    continue
+        if pack_day:
+            parts.append("打包机会：%d月%d日起 %s 可达 %g 点（线 %g，软件不自动扣）"
+                         % (m, pack_day[0], big_note, pack_day[1], pack_cost))
+        elif big_note and pack_cost > 0:
+            peak = (-1.0, None)
+            for d in sorted(bmap, key=lambda x: int(x)):
+                if curday is not None and int(d) < int(curday):
+                    continue
+                try:
+                    v = float((bmap[d] or {})[big_note])
+                    if v > peak[0]:
+                        peak = (v, int(d))
+                except Exception:
+                    continue
+            if peak[1] is not None:
+                parts.append("打包：%s 规划期内最高约 %g 点，距打包线 %g 还差 %g 点"
+                             % (big_note, peak[0], pack_cost, round(max(0, pack_cost - peak[0]), 2)))
+
+        # 负余额告警
+        negs = []
+        for r in getattr(self, "rows", []):
+            try:
+                bal = float(r.bal_var.get() or 0)
+            except ValueError:
+                bal = 0.0
+            if bal < 0:
+                negs.append("%s %g" % (r.note_var.get().strip() or r.role_var.get(), bal))
+        if negs:
+            parts.append("⚠ 负余额（后端照扣）：" + "、".join(negs))
+
+        self.overview_var.set("  ｜  ".join(parts))
+
     # ---- 今日执行面板：按系统日期每天自动更新 ----
     def _tick_today(self, check_only=False):
+        self._refresh_overview()   # 参数/余额手改后回到窗口即可看到最新速览
         key = datetime.date.today().isoformat()
         if key != getattr(self, "_today_key", None):
             self._today_key = key
@@ -1117,6 +1254,7 @@ class App(tk.Tk):
             self.after(30000, self._tick_today)
 
     def _refresh_today_panel(self):
+        self._refresh_overview()
         if not hasattr(self, "today_lines"):
             return
         for c in list(self.today_lines.winfo_children()):
@@ -1181,8 +1319,18 @@ class App(tk.Tk):
         if not day_actions and not warns:
             ttk.Label(self.today_lines, text="今日无安排（休息日）。", foreground="#666").pack(anchor="w")
             return
+        bmap = plan.get("balance_curve") or {}
+        prev = str(int(now.day) - 1)
         for note, acts in day_actions.items():
-            txt = "· %s：%s" % (note, "、".join(acts) if acts else "静默（不登录、不操作）")
+            extra = ""
+            try:
+                v = float((bmap.get(str(now.day)) or {})[note])
+                base = (bmap.get(prev) or {}).get(note,
+                        (plan.get("start_bal") or {}).get(note, v))
+                extra = "（今日净 %+g）" % round(v - float(base), 2)
+            except Exception:
+                pass
+            txt = "· %s：%s%s" % (note, "、".join(acts) if acts else "静默（不登录、不操作）", extra)
             ttk.Label(self.today_lines, text=txt).pack(anchor="w")
         for w in warns:
             ttk.Label(self.today_lines, text=w, foreground="#c00").pack(anchor="w")
@@ -1564,31 +1712,51 @@ class App(tk.Tk):
         return accounts, p
 
     # ---- 事件 ----
+    def _make_plan_snapshot(self):
+        """按当前界面生成一份完整方案快照（不弹窗、不采用）。"""
+        accounts, p = self.collect()
+        text, rows, _sections, actions, balance_curve, login_curve, expiry = build_plan(
+            accounts, p, self.ctx, pack_on_start=self.pack_today_var.get())
+        self.last_rows = rows
+        c = self.ctx
+        return {
+            "year": c["year"], "month": c["month"],
+            "start_day": c["start_day"], "end_day": c["days_in_month"],
+            "text": text,                       # 完整方案全文，供「查看当前方案」随时回看
+            "rows": rows,                       # 明细行，供查看时导出 CSV
+            "actions": {str(d): dict(v) for d, v in actions.items()},
+            "balance_curve": {str(d): dict(v) for d, v in balance_curve.items()},
+            "login_curve": {str(d): dict(v) for d, v in login_curve.items()},
+            "expiry_info": {k: [list(b) for b in v] for k, v in expiry.items()},
+            "start_bal": {a["note"]: float(a["balance"]) for a in accounts},
+            "start_login": {a["note"]: int(a.get("login_claimed", 0)) for a in accounts},
+            "login_cap": int(p["login_days_cap"]),
+            "packed_on_start": bool(self.pack_today_var.get()),
+        }
+
     def on_generate(self):
         try:
-            accounts, p = self.collect()
-            text, rows, _sections, actions, balance_curve, login_curve, expiry = build_plan(
-                accounts, p, self.ctx, pack_on_start=self.pack_today_var.get())
-            self.last_rows = rows
-            c = self.ctx
-            self.pending_plan = {
-                "year": c["year"], "month": c["month"],
-                "start_day": c["start_day"], "end_day": c["days_in_month"],
-                "text": text,                       # 完整方案全文，供「查看当前方案」随时回看
-                "rows": rows,                       # 明细行，供查看时导出 CSV
-                "actions": {str(d): dict(v) for d, v in actions.items()},
-                "balance_curve": {str(d): dict(v) for d, v in balance_curve.items()},
-                "login_curve": {str(d): dict(v) for d, v in login_curve.items()},
-                "expiry_info": {k: [list(b) for b in v] for k, v in expiry.items()},
-                "start_bal": {a["note"]: float(a["balance"]) for a in accounts},
-                "start_login": {a["note"]: int(a.get("login_claimed", 0)) for a in accounts},
-                "login_cap": int(p["login_days_cap"]),
-                "packed_on_start": bool(self.pack_today_var.get()),
-            }
+            self.pending_plan = self._make_plan_snapshot()
             self._auto_save()  # 生成时顺手保存，改动即时落盘
-            self._show_plan(text)  # 方案在独立窗口以单一页面完整展示
+            self._show_plan(self.pending_plan["text"])  # 独立窗口单页完整展示
         except Exception as e:
             messagebox.showerror("无法生成方案", str(e))
+
+    def on_quick_adopt(self):
+        """最少操作：一次点击生成并采用，主页面立即显示今日安排与速览。"""
+        if getattr(self, "adopted_plan", None) and not messagebox.askyesno(
+                "提示", "已有采用中的方案，一键生成并采用会替换它。继续吗？", parent=self):
+            return
+        try:
+            self.pending_plan = self._make_plan_snapshot()
+            self._apply_plan(self.pending_plan)
+            messagebox.showinfo(
+                "已一键采用",
+                "方案已生成并采用。主页面今天就能看到每个号该做什么、净变动、到期时间和打包机会。\n"
+                "想看完整方案点「查看当前方案」，想逐笔核对点「查看加减明细」，都不用重新生成。",
+                parent=self)
+        except Exception as e:
+            messagebox.showerror("无法生成并采用", str(e))
 
     # ---- 方案独立页面：一页看完整方案，不拆分页签 ----
     def _show_plan(self, text, adopted=False):
@@ -1938,19 +2106,27 @@ class App(tk.Tk):
             return
         self._show_plan(text, adopted=True)
 
-    def _adopt_plan(self):
-        """确认采用当前生成的方案：持久化快照，主页面从此每天自动显示各号操作。"""
-        plan = getattr(self, "pending_plan", None)
-        if not plan:
-            messagebox.showwarning("提示", "请先生成方案。", parent=self.plan_win)
-            return
+    def _apply_plan(self, plan):
+        """采用一份方案快照：持久化 + 刷新主页面 + 立即推进当天余额。"""
         self.adopted_plan = dict(plan)
         self.adopted_plan["adopted_at"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
         self.adopted_plan.pop("last_advance_day", None)  # 新方案从头推进
         self._auto_save()
         self.plan_tip.pack_forget()   # 采用后不再需要生成引导，留出今日执行空间
-        self._refresh_today_panel()
+        self._refresh_today_panel()   # 内含一眼速览刷新
         self._advance_balances()      # 采用即按方案推进当天余额
+        self._refresh_overview()      # 推进后再刷一次，保证净变动/余额信息是最新
+
+    def _adopt_plan(self):
+        """确认采用当前生成的方案：持久化快照，主页面从此每天自动显示各号操作。"""
+        plan = getattr(self, "pending_plan", None)
+        if not plan:
+            parent = getattr(self, "plan_win", None)
+            if parent is None or not parent.winfo_exists():
+                parent = self
+            messagebox.showwarning("提示", "请先生成方案。", parent=parent)
+            return
+        self._apply_plan(plan)
         self._close_plan()
         messagebox.showinfo("已采用",
                             "方案已采用。主页面会每天自动显示当天各号该做什么，当前秒点也会按方案自动扣/加。\n想看完整方案时，点「查看当前方案」即可回看，不用重新生成。",

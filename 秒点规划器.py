@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-秒点规划器 v1.14.0
+秒点规划器 v1.15.0
 根据每个账号当前秒点余额，模拟并生成「点赞 / 登录领奖 / 复制转账 / 打包」的执行方案。
 用 Python 3.12 + tkinter，可打包为单文件 exe。
 """
@@ -25,7 +25,7 @@ import datetime
 import calendar
 
 APP_NAME = "秒点规划器"
-VERSION = "1.14.0"
+VERSION = "1.15.0"
 APP_VERSION = VERSION   # 版本更新模块使用
 
 # ===== 内置「版本更新」配置 =====
@@ -441,6 +441,24 @@ def _day_text(year, month, day, days_in_month=None):
     return "%d月%d日" % (m2, day - days_in_month)
 
 
+def _date_stamp(year, month, day, days_in_month=None):
+    """平台口径的日期戳 YYYY-MM-DD；超过当月天数按真实日历跨月、跨年进位。"""
+    if days_in_month is None:
+        days_in_month = calendar.monthrange(year, month)[1]
+    if day <= days_in_month:
+        y, m, d = year, month, day
+    else:
+        base = datetime.date(year, month, days_in_month)
+        t = base + datetime.timedelta(days=day - days_in_month)
+        y, m, d = t.year, t.month, t.day
+    return "%04d-%02d-%02d" % (y, m, d)
+
+
+def _expire_stamp(year, month, day, days_in_month=None):
+    """平台口径的到期时间戳：到期日当天 00:00 失效（截图：发生 11-27 → 到期 12-04 00:00）。"""
+    return _date_stamp(year, month, day, days_in_month) + " 00:00"
+
+
 def simulate_small(ac, p, start_day=1, rest_days=None, cal=None):
     """模拟一个小号。返回 (copies, daily_events, author_income, end_balance, login_used, queue)
     start_day: 方案起始的真实日历日（今天几号），所有 day 均为日历日。
@@ -494,10 +512,10 @@ def simulate_small(ac, p, start_day=1, rest_days=None, cal=None):
             label = "登录领奖+点赞" if login_flag else "点赞"
             if p["expiry_days"] > 0:
                 if cal:
-                    label += "(本批%s过期)" % _day_text(
+                    label += "(本批%s到期)" % _expire_stamp(
                         cal["year"], cal["month"], d + p["expiry_days"], cal["days"])
                 else:
-                    label += "(本批%d日过期)" % (d + p["expiry_days"])
+                    label += "(本批第%d天到期)" % (d + p["expiry_days"])
             if pay > 0:
                 label += "(其中%g还欠费)" % round(pay, 2)
             events.append((d, label, round(gain + pay, 2), now))
@@ -574,10 +592,10 @@ def simulate_big(ac, p, income_by_day, start_day=1, rest_days=None, pack_on_star
             label = "收款+活跃"
             if p["expiry_days"] > 0:
                 if cal:
-                    label += "(本批%s过期)" % _day_text(
+                    label += "(本批%s到期)" % _expire_stamp(
                         cal["year"], cal["month"], d + p["expiry_days"], cal["days"])
                 else:
-                    label += "(本批%d日过期)" % (d + p["expiry_days"])
+                    label += "(本批第%d天到期)" % (d + p["expiry_days"])
             if pay > 0:
                 label += "(其中%g还欠费)" % round(pay, 2)
             events.append((d, label, round(day_gain + inc, 2), _bal()))
@@ -689,10 +707,10 @@ def build_plan(accounts, p, ctx=None, pack_on_start=False):
     for note in [ac["note"] for ac in smalls] + [big["note"]]:
         for s, e, a in expiry_info.get(note, []):
             if e <= start_day + p["plan_days"]:
-                warn_lines.append("  ⚠ %s：%g 点（%s获得的）将于 %s 到期，没用掉就流失"
+                warn_lines.append("  ⚠ %s：%g 点（%s 发生）到期时间 %s，没用掉就流失"
                                   % (note, a,
-                                     _day_text(ctx["year"], ctx["month"], s, ctx["days_in_month"]),
-                                     _day_text(ctx["year"], ctx["month"], e, ctx["days_in_month"])))
+                                     _date_stamp(ctx["year"], ctx["month"], s, ctx["days_in_month"]),
+                                     _expire_stamp(ctx["year"], ctx["month"], e, ctx["days_in_month"])))
     if warn_lines:
         sec_overview.append("到期提醒（平台优先消耗快到期的秒点，先到期的先扣）：")
         sec_overview += warn_lines
@@ -822,8 +840,8 @@ def build_plan(accounts, p, ctx=None, pack_on_start=False):
         sec_big.append("提示：作品数量建议≥2，否则同一账号可能连续复制同一作品。")
     sec_big.append("说明：方案按真实日历日排布（%d月%d日～%d日）；当前余额按起始日可用计入并从起始日起算有效期；" %
                    (ctx["month"], ctx["start_day"], ctx["days_in_month"]))
-    sec_big.append("      平台优先消耗快到期的秒点（先获得的先扣），到期没用掉会自然流失；现有余额的")
-    sec_big.append("      真实到期日以平台【首页→秒点→最近一笔即将到期】为准，本方案按起始日+%d天近似。" % p["expiry_days"])
+    sec_big.append("      平台优先消耗快到期的秒点（先发生的先扣），到期没用掉会自然流失；到期时间按平台口径")
+    sec_big.append("      「发生日+%d天 = 到期日当天 00:00 失效」显示。当前余额以起始日发生近似，真实时间以平台明细为准。" % p["expiry_days"])
     sec_big.append("      余额请填「调整好作品之后」的实际数（调整消耗的秒点已含在内，软件不再另扣）。")
     sec_big.append("      打包平时不自动做；要打包就在界面勾选，生成时只扣那一次。改了余额记得重新生成。")
 
@@ -1304,7 +1322,7 @@ class App(tk.Tk):
             chunks = []
             for edate in sorted(due)[:2]:
                 items = "、".join("%s %g点" % (n, a) for n, a in due[edate])
-                chunks.append("%d月%d日 %s" % (edate.month, edate.day, items))
+                chunks.append("%s %s" % (edate.strftime("%Y-%m-%d 00:00"), items))
             parts.append("⚠ 7天内到期：" + "；".join(chunks) + "（没用掉会流失）")
         else:
             parts.append("7天内无秒点到期")
@@ -1432,10 +1450,11 @@ class App(tk.Tk):
                     except Exception:
                         continue
                     if edate == day_obj:
-                        lines.append("⚠ %s：%g 点今天到期，没用掉今天就流失！" % (note, a))
+                        lines.append("⚠ %s：%g 点今天到期（%s），没用掉今天就流失！" %
+                                     (note, a, edate.strftime("%Y-%m-%d 00:00")))
                     elif edate == day_obj + datetime.timedelta(days=1):
-                        lines.append("⚠ %s：%g 点明天（%s）到期，尽快用掉" %
-                                     (note, a, _day_text(y_, m_, e, days_)))
+                        lines.append("⚠ %s：%g 点明天到期（%s），尽快用掉" %
+                                     (note, a, edate.strftime("%Y-%m-%d 00:00")))
             return lines
 
         day_actions = actions.get(str(now.day), {})
@@ -2010,16 +2029,16 @@ class App(tk.Tk):
             cur[note] = bal
             mark = "  ⚠负数" if bal < 0 else ""
             lines.append("  %s%s 点%s" % (_pad(note, 14), _pad("%g" % bal, 10, "right"), mark))
-            # 附到期批次：平台优先消耗快到期的秒点，到期没用掉就自然流失
-            # 日期跨月时自动显示下个月的真实日期（如 11月28日获得+7天 → 12月5日过期）
+            # 附到期批次：平台口径「发生时间 → 到期时间(00:00 失效)」，可直接与平台秒点明细对照
+            # 跨月、跨年按真实日历进位（如 2026-11-28 发生 → 2026-12-05 00:00 到期）
             for b in exp_info.get(note, []):
                 try:
                     if py_ is None:
                         continue
-                    lines.append("      ↳ %s点（%s获得）→ %s过期" % (
+                    lines.append("      ↳ %s点（发生 %s → 到期 %s）" % (
                         _pad("%g" % float(b[2]), 5),
-                        _day_text(py_, pm_, int(b[0]), pdays_),
-                        _day_text(py_, pm_, int(b[1]), pdays_)))
+                        _date_stamp(py_, pm_, int(b[0]), pdays_),
+                        _expire_stamp(py_, pm_, int(b[1]), pdays_)))
                 except Exception:
                     continue
 

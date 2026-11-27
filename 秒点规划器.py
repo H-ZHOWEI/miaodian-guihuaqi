@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-秒点规划器 v1.13.0
+秒点规划器 v1.14.0
 根据每个账号当前秒点余额，模拟并生成「点赞 / 登录领奖 / 复制转账 / 打包」的执行方案。
 用 Python 3.12 + tkinter，可打包为单文件 exe。
 """
@@ -25,7 +25,7 @@ import datetime
 import calendar
 
 APP_NAME = "秒点规划器"
-VERSION = "1.13.0"
+VERSION = "1.14.0"
 APP_VERSION = VERSION   # 版本更新模块使用
 
 # ===== 内置「版本更新」配置 =====
@@ -883,28 +883,51 @@ def _fill_login_curve(curve, note, start_claimed, p, start_day, rest_days):
 
 
 # ---------- GUI ----------
+# ---------- 视觉规范（仅外观，不影响任何计算）----------
+C_BG = "#F4F6FA"          # 页面底色
+C_SURFACE = "#FFFFFF"     # 卡片底色
+C_BORDER = "#E3E8EF"      # 卡片描边
+C_INK = "#172033"         # 主文字
+C_MUTED = "#667085"       # 次要文字
+C_PRIMARY = "#2F6BED"     # 主操作蓝
+C_PRIMARY_DARK = "#2457CC"
+C_NAVY = "#1B263B"        # 顶部导航
+C_SUCCESS = "#0E9F6E"
+C_WARN = "#B54708"
+C_DANGER = "#D92D20"
+FONT = "Microsoft YaHei"
+
+
 class AccountRow:
     def __init__(self, parent, role, idx, note="", balance=0, login_claimed=0, on_delete=None):
         self.role = role
-        self.frame = ttk.Frame(parent, style="Card.TFrame")
+        self.frame = tk.Frame(parent, bg=C_SURFACE, highlightthickness=1,
+                              highlightbackground=C_BORDER)
         self.role_var = tk.StringVar(value="大号" if role == "big" else "小号%d" % idx)
         self.note_var = tk.StringVar(value=note)
         self.bal_var = tk.StringVar(value=str(balance))
         self.login_var = tk.StringVar(value=str(login_claimed))
 
-        ttk.Label(self.frame, textvariable=self.role_var, width=8,
-                  font=("Microsoft YaHei", 10, "bold")).grid(row=0, column=0, padx=6, pady=6)
-        ttk.Label(self.frame, text="备注").grid(row=0, column=1, padx=3)
-        ttk.Entry(self.frame, textvariable=self.note_var, width=12).grid(row=0, column=2, padx=3)
-        ttk.Label(self.frame, text="当前秒点").grid(row=0, column=3, padx=3)
-        ttk.Entry(self.frame, textvariable=self.bal_var, width=9).grid(row=0, column=4, padx=3)
+        badge_bg, badge_fg = (("#EEF2FF", "#4338CA") if role == "big"
+                              else ("#EFF6FF", "#1D4ED8"))
+        tk.Label(self.frame, textvariable=self.role_var, width=7, bg=badge_bg, fg=badge_fg,
+                 font=(FONT, 10, "bold"), pady=2).grid(row=0, column=0, padx=(10, 8), pady=2)
+        tk.Label(self.frame, text="备注", bg=C_SURFACE, fg=C_MUTED,
+                 font=(FONT, 9)).grid(row=0, column=1, padx=(0, 4))
+        ttk.Entry(self.frame, textvariable=self.note_var, width=13).grid(
+            row=0, column=2, padx=(0, 14), sticky="w")
+        tk.Label(self.frame, text="当前秒点", bg=C_SURFACE, fg=C_MUTED,
+                 font=(FONT, 9)).grid(row=0, column=3, padx=(0, 4))
+        ttk.Entry(self.frame, textvariable=self.bal_var, width=8).grid(
+            row=0, column=4, padx=(0, 14), sticky="w")
         # 大号和小号都需要「本月已领登录天数」（两者都涉及登录奖励）
-        ttk.Label(self.frame, text="本月已领登录(天)").grid(row=0, column=5, padx=3)
+        tk.Label(self.frame, text="本月已领登录(天)", bg=C_SURFACE, fg=C_MUTED,
+                 font=(FONT, 9)).grid(row=0, column=5, padx=(0, 4))
         ttk.Spinbox(self.frame, from_=0, to=7, textvariable=self.login_var,
-                    width=4).grid(row=0, column=6, padx=3)
+                    width=4).grid(row=0, column=6, sticky="w")
         if role == "small":
-            ttk.Button(self.frame, text="删除", width=6,
-                       command=on_delete).grid(row=0, column=7, padx=6)
+            ttk.Button(self.frame, text="删除", width=6, style="Ghost.TButton",
+                       command=on_delete).grid(row=0, column=7, padx=(12, 10))
 
     def to_dict(self):
         bal = float(self.bal_var.get() or 0)
@@ -917,9 +940,8 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("%s v%s" % (APP_NAME, VERSION))
-        self.geometry("960x880")
-        self.minsize(880, 800)
-        self.configure(padx=10, pady=8)
+        self.geometry("1000x920")
+        self.minsize(940, 860)
         self.rows = []
         self.small_counter = 0
         self.last_rows = None
@@ -952,123 +974,215 @@ class App(tk.Tk):
         # 每次启动后台静默检查更新（不打断使用）
         self.after(300, lambda: self._check_update(manual=False))
 
+    def _card(self, parent, title, subtitle=""):
+        """统一的白色卡片容器：标题 + 可选副标题，调用方自行 pack。"""
+        f = tk.Frame(parent, bg=C_SURFACE, highlightthickness=1,
+                     highlightbackground=C_BORDER)
+        h = tk.Frame(f, bg=C_SURFACE)
+        h.pack(fill="x", padx=16, pady=(8, 4))
+        tk.Label(h, text=title, bg=C_SURFACE, fg=C_INK,
+                 font=(FONT, 11, "bold")).pack(side="left")
+        if subtitle:
+            tk.Label(h, text=subtitle, bg=C_SURFACE, fg=C_MUTED,
+                     font=(FONT, 9)).pack(side="left", padx=10)
+        return f
+
     def _build_style(self):
+        self.configure(bg=C_BG)
         st = ttk.Style(self)
         try:
             st.theme_use("clam")
         except Exception:
             pass
-        st.configure("Card.TFrame", relief="groove", borderwidth=1)
-        st.configure("TLabel", font=("Microsoft YaHei", 10))
-        st.configure("TButton", font=("Microsoft YaHei", 10))
-        st.configure("TEntry", font=("Microsoft YaHei", 10))
-        st.configure("Title.TLabel", font=("Microsoft YaHei", 15, "bold"))
+        st.configure("TFrame", background=C_BG)
+        st.configure("Bg.TFrame", background=C_BG)
+        st.configure("TLabel", background=C_SURFACE, foreground=C_INK, font=(FONT, 10))
+        st.configure("Bg.TLabel", background=C_BG, foreground=C_MUTED, font=(FONT, 9))
+        st.configure("Muted.TLabel", background=C_SURFACE, foreground=C_MUTED, font=(FONT, 9))
+        st.configure("Section.TLabel", background=C_SURFACE, foreground=C_INK,
+                     font=(FONT, 10, "bold"))
+        st.configure("Info.TLabel", background=C_SURFACE, foreground=C_PRIMARY,
+                     font=(FONT, 10, "bold"))
+        st.configure("Ok.TLabel", background=C_SURFACE, foreground=C_SUCCESS, font=(FONT, 9))
+        st.configure("Warn.TLabel", background=C_SURFACE, foreground=C_WARN, font=(FONT, 9))
+        st.configure("Danger.TLabel", background=C_SURFACE, foreground=C_DANGER, font=(FONT, 9))
+        st.configure("TButton", font=(FONT, 10), padding=(10, 5), background=C_SURFACE,
+                     foreground=C_INK, bordercolor=C_BORDER, relief="flat")
+        st.map("TButton", background=[("active", "#F1F5F9"), ("pressed", "#E2E8F0")])
+        st.configure("Primary.TButton", font=(FONT, 10, "bold"), padding=(16, 7),
+                     background=C_PRIMARY, foreground="#FFFFFF", bordercolor=C_PRIMARY,
+                     relief="flat")
+        st.map("Primary.TButton", background=[("active", C_PRIMARY_DARK),
+                                              ("pressed", C_PRIMARY_DARK)])
+        st.configure("Ghost.TButton", font=(FONT, 9), padding=(6, 3), background="#FFF1F0",
+                     foreground=C_DANGER, bordercolor="#FECACA", relief="flat")
+        st.map("Ghost.TButton", background=[("active", "#FFE0DE")])
+        st.configure("TEntry", fieldbackground="#FFFFFF", background="#FFFFFF",
+                     bordercolor=C_BORDER, foreground=C_INK, padding=(6, 4),
+                     font=(FONT, 10), insertcolor=C_INK)
+        st.configure("TSpinbox", fieldbackground="#FFFFFF", background="#FFFFFF",
+                     bordercolor=C_BORDER, foreground=C_INK, padding=(4, 3),
+                     font=(FONT, 10), arrowsize=12)
+        st.configure("TCheckbutton", background=C_SURFACE, foreground=C_INK,
+                     font=(FONT, 10), indicatorcolor="#FFFFFF", bordercolor=C_BORDER)
+        st.map("TCheckbutton", background=[("active", C_SURFACE)])
+        st.configure("TRadiobutton", background=C_SURFACE, foreground=C_INK, font=(FONT, 10))
+
+    def _header_button(self, parent, text, command):
+        return tk.Button(parent, text=text, command=command, bg="#334155", fg="#E2E8F0",
+                         activebackground="#475569", activeforeground="#FFFFFF",
+                         relief="flat", bd=0, padx=10, pady=4, font=(FONT, 9), cursor="hand2")
 
     def _build_ui(self):
-        # ===== 顶部更新抬头（常驻）：版本号 + 检查更新 + 状态 + 恢复默认地址 =====
-        top = tk.Frame(self, bg="#2c3e50")
-        top.pack(fill="x", pady=(0, 4))
-        self.ver_label = tk.Label(top, text="v" + APP_VERSION, bg="#2c3e50", fg="#cfe3ff",
-                                  font=("Microsoft YaHei", 10, "bold"), cursor="hand2")
-        self.ver_label.pack(side="left", padx=(8, 6))
+        # ===== 顶部导航：品牌 / 更新状态 =====
+        head = tk.Frame(self, bg=C_NAVY, height=58)
+        head.pack(fill="x")
+        head.pack_propagate(False)
+        left = tk.Frame(head, bg=C_NAVY)
+        left.pack(side="left", padx=(18, 0))
+        tk.Label(left, text="秒点规划器", bg=C_NAVY, fg="#FFFFFF",
+                 font=(FONT, 15, "bold")).pack(anchor="w")
+        tk.Label(left, text="点赞 · 复制 · 打包，一眼看清每天怎么操作", bg=C_NAVY,
+                 fg="#9FB3CC", font=(FONT, 9)).pack(anchor="w")
+        right = tk.Frame(head, bg=C_NAVY)
+        right.pack(side="right", padx=(0, 14))
+        self.ver_label = tk.Label(right, text="v" + APP_VERSION, bg="#334155", fg="#E2E8F0",
+                                  font=(FONT, 9, "bold"), padx=8, pady=3, cursor="hand2")
+        self.ver_label.pack(side="left", padx=(0, 10))
         self.ver_label.bind("<Button-1>", lambda e: self._check_update(manual=True))
-        self.update_btn = ttk.Button(top, text="检查更新",
-                                     command=lambda: self._check_update(manual=True))
-        self.update_btn.pack(side="left", padx=(0, 8))
-        self.update_status = tk.Label(top, text="", bg="#2c3e50", fg="#aab7c4",
-                                      font=("Microsoft YaHei", 9))
+        self.update_btn = self._header_button(right, "检查更新",
+                                              lambda: self._check_update(manual=True))
+        self.update_btn.pack(side="left", padx=(0, 10))
+        self.update_status = tk.Label(right, text="", bg=C_NAVY, fg="#94A3B8",
+                                      font=(FONT, 9))
         self.update_status.pack(side="left", padx=(0, 8))
-        self.restore_src_btn = ttk.Button(top, text="恢复默认更新地址",
-                                          command=self._restore_default_source)
+        self.restore_src_btn = self._header_button(right, "恢复默认更新地址",
+                                                   self._restore_default_source)
         if load_update_config().get("source"):
             self.restore_src_btn.pack(side="left", padx=(0, 6))
 
         # ===== 非模态更新横幅（默认隐藏，发现新版时弹出）=====
-        b = tk.Frame(self, bg="#fff3cd", relief="solid", borderwidth=1)
-        b.pack(fill="x")
+        b = tk.Frame(self, bg="#FFFAEB", highlightthickness=1, highlightbackground="#FEDF89")
+        b.pack(fill="x", pady=(10, 0))
         b.pack_forget()
         self.banner = b
-        inner = tk.Frame(b, bg="#fff3cd")
-        inner.pack(fill="x", padx=10, pady=6)
-        self.banner_text = tk.Label(inner, text="", bg="#fff3cd", fg="#7a5b00",
-                                    font=("Microsoft YaHei", 10, "bold"))
+        inner = tk.Frame(b, bg="#FFFAEB")
+        inner.pack(fill="x", padx=12, pady=8)
+        self.banner_text = tk.Label(inner, text="", bg="#FFFAEB", fg="#93370D",
+                                    font=(FONT, 10, "bold"))
         self.banner_text.pack(side="left")
-        self.banner_notes = tk.Label(inner, text="", bg="#fff3cd", fg="#8a6d00",
-                                     font=("Microsoft YaHei", 9))
+        self.banner_notes = tk.Label(inner, text="", bg="#FFFAEB", fg="#B54708",
+                                     font=(FONT, 9))
         self.banner_notes.pack(side="left", padx=8)
-        self.banner_stage = tk.Label(inner, text="", bg="#fff3cd", fg="#8a6d00",
-                                     font=("Microsoft YaHei", 9))
+        self.banner_stage = tk.Label(inner, text="", bg="#FFFAEB", fg="#B54708",
+                                     font=(FONT, 9))
         self.banner_stage.pack(side="left", padx=8)
         self.banner_pb = ttk.Progressbar(inner, orient="horizontal",
                                          mode="determinate", maximum=1)
-        bf = tk.Frame(inner, bg="#fff3cd")
+        bf = tk.Frame(inner, bg="#FFFAEB")
         bf.pack(side="right")
-        self.btn_now = ttk.Button(bf, text="立即更新", command=self._start_download)
+        self.btn_now = ttk.Button(bf, text="立即更新", style="Primary.TButton",
+                                  command=self._start_download)
         self.btn_now.pack(side="left", padx=3)
         self.btn_skip = ttk.Button(bf, text="跳过此版本", command=self._on_skip)
         self.btn_skip.pack(side="left", padx=3)
         self.btn_later = ttk.Button(bf, text="稍后再说", command=self._on_later)
         self.btn_later.pack(side="left", padx=3)
 
-        ttk.Label(self, text="秒点规划器", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(self, text="填入各账号当前秒点 → 一键生成点赞 / 复制 / 打包方案",
-                  foreground="#666").pack(anchor="w", pady=(0, 4))
-        # 日期栏（可刷新）
+        # ===== 可滚动主区域：内容再多也不会被窗口截断 =====
+        wrap = tk.Frame(self, bg=C_BG)
+        self._main_wrap = wrap
+        wrap.pack(fill="both", expand=True)
+        canvas = tk.Canvas(wrap, bg=C_BG, highlightthickness=0)
+        vbar = ttk.Scrollbar(wrap, orient="vertical", command=canvas.yview)
+        canvas.pack(side="left", fill="both", expand=True)
+        vbar.pack(side="right", fill="y")
+        content = tk.Frame(canvas, bg=C_BG)
+        win_id = canvas.create_window((0, 0), window=content, anchor="nw")
+        canvas.configure(yscrollcommand=vbar.set)
+        canvas.bind("<Configure>", lambda e: (canvas.itemconfig(win_id, width=e.width),
+                                             canvas.configure(scrollregion=canvas.bbox("all"))))
+        content.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        self.bind("<MouseWheel>", lambda e: canvas.yview_scroll(-1 if e.delta > 0 else 1, "units"))
+
+        # ===== 本月安排 =====
+        info = self._card(content, "本月安排", "按系统日期自动计算")
+        info.pack(fill="x", pady=(8, 6))
+        info_row = tk.Frame(info, bg=C_SURFACE)
+        info_row.pack(fill="x", padx=16, pady=(0, 8))
         self.date_var = tk.StringVar()
         self.rest_var = tk.StringVar()
-        ttk.Label(self, textvariable=self.date_var, foreground="#0a6",
-                  font=("Microsoft YaHei", 10, "bold")).pack(anchor="w", pady=(0, 2))
-        ttk.Label(self, textvariable=self.rest_var, foreground="#c60",
-                  font=("Microsoft YaHei", 10)).pack(anchor="w", pady=(0, 6))
+        ttk.Label(info_row, textvariable=self.date_var, style="Info.TLabel",
+                  anchor="w").pack(fill="x")
+        ttk.Label(info_row, textvariable=self.rest_var, style="Warn.TLabel",
+                  anchor="w").pack(fill="x", pady=(4, 0))
 
-        # 一眼速览：把原本要点按钮/切窗口才看得到的关键信息主动摊在主界面
-        ov = ttk.LabelFrame(self, text=" 一眼速览（自动更新） ", padding=6)
-        ov.pack(fill="x", pady=(0, 6))
+        # ===== 一眼速览：关键数据主动呈现，不用点按钮 =====
+        ov = self._card(content, "一眼速览", "自动更新")
+        ov.pack(fill="x", pady=(0, 8))
+        ov_row = tk.Frame(ov, bg=C_SURFACE)
+        ov_row.pack(fill="x", padx=16, pady=(0, 10))
         self.overview_var = tk.StringVar(value="")
-        ttk.Label(ov, textvariable=self.overview_var, foreground="#184",
-                  wraplength=900, justify="left").pack(anchor="w")
+        ttk.Label(ov_row, textvariable=self.overview_var, style="Info.TLabel",
+                  wraplength=780, justify="left").pack(anchor="w")
 
-        # 今日执行面板：确认采用方案后，每天自动显示各号该做什么
-        self.today_frame = ttk.LabelFrame(self, text=" 今日执行（每天自动更新） ", padding=6)
-        self.today_frame.pack(fill="x", pady=(0, 6))
+        # ===== 今日执行 + 执行状态（并排）=====
+        duo = tk.Frame(content, bg=C_BG)
+        duo.pack(fill="x")
+        duo.columnconfigure(0, weight=3)
+        duo.columnconfigure(1, weight=2)
+        self.today_frame = self._card(duo, "今日执行", "采用方案后每天自动更新")
+        self.today_frame.grid(row=0, column=0, sticky="nsew", pady=(0, 8))
         self.today_date_var = tk.StringVar()
-        ttk.Label(self.today_frame, textvariable=self.today_date_var,
-                  font=("Microsoft YaHei", 10, "bold"), foreground="#066").pack(anchor="w")
-        self.today_lines = ttk.Frame(self.today_frame)
-        self.today_lines.pack(fill="x", pady=(2, 0))
+        inner = tk.Frame(self.today_frame, bg=C_SURFACE)
+        inner.pack(fill="x", padx=16, pady=(0, 12))
+        ttk.Label(inner, textvariable=self.today_date_var,
+                  style="Section.TLabel").pack(anchor="w")
+        self.today_lines = tk.Frame(inner, bg=C_SURFACE)
+        self.today_lines.pack(fill="x", pady=(6, 0))
         self.balance_sync_var = tk.StringVar()
-        ttk.Label(self.today_frame, textvariable=self.balance_sync_var,
-                  foreground="#0a6").pack(anchor="w", pady=(4, 0))
+        ttk.Label(inner, textvariable=self.balance_sync_var,
+                  style="Ok.TLabel", wraplength=520).pack(anchor="w", pady=(6, 0))
 
-        # 起始状态开关区
-        sw = ttk.LabelFrame(self, text=" 执行状态（生成方案前先确认） ", padding=6)
-        sw.pack(fill="x", pady=(0, 6))
-        ttk.Checkbutton(sw, text="今天各号已全部操作过（勾选→方案从明天排起）",
-                        variable=self.today_done_var,
-                        command=self._on_switch_changed).pack(anchor="w")
-        ttk.Checkbutton(sw, text="今天我要打包（勾选→方案第一天打包一次并扣点；平时不打包）",
-                        variable=self.pack_today_var,
-                        command=self._on_switch_changed).pack(anchor="w")
+        sw = self._card(duo, "执行状态", "生成前确认")
+        sw.grid(row=0, column=1, sticky="nsew", padx=(8, 0), pady=(0, 8))
+        srow = tk.Frame(sw, bg=C_SURFACE)
+        srow.pack(fill="x", padx=16, pady=(0, 8))
+        tk.Checkbutton(srow, text="今天已全部操作过（方案从明天排起）",
+                       variable=self.today_done_var, wraplength=330, justify="left",
+                       bg=C_SURFACE, fg=C_INK, activebackground=C_SURFACE,
+                       selectcolor="#FFFFFF", font=(FONT, 10), anchor="w",
+                       command=self._on_switch_changed).pack(anchor="w", pady=2)
+        tk.Checkbutton(srow, text="今天我要打包（仅起始日打包一次）",
+                       variable=self.pack_today_var, wraplength=330, justify="left",
+                       bg=C_SURFACE, fg=C_INK, activebackground=C_SURFACE,
+                       selectcolor="#FFFFFF", font=(FONT, 10), anchor="w",
+                       command=self._on_switch_changed).pack(anchor="w", pady=2)
 
-        # 账号区
-        acc_box = ttk.LabelFrame(self, text=" 账号（可增删小号、改备注与当前秒点） ", padding=8)
-        acc_box.pack(fill="x")
-        self.acc_list = ttk.Frame(acc_box)
+        # ===== 账号 =====
+        acc_box = self._card(content, "账号", "可增删小号、改备注与当前秒点")
+        acc_box.pack(fill="x", pady=(0, 8))
+        holder = tk.Frame(acc_box, bg=C_SURFACE)
+        holder.pack(fill="x", padx=16, pady=(0, 8))
+        self.acc_list = tk.Frame(holder, bg=C_SURFACE)
         self.acc_list.pack(fill="x")
-        btn_bar = ttk.Frame(acc_box)
-        btn_bar.pack(fill="x", pady=(6, 0))
+        btn_bar = tk.Frame(holder, bg=C_SURFACE)
+        btn_bar.pack(fill="x", pady=(8, 0))
         ttk.Button(btn_bar, text="＋ 添加小号", command=self.add_small).pack(side="left")
-        ttk.Button(btn_bar, text="重置为 1大3小", command=self._load_defaults).pack(side="left", padx=6)
+        ttk.Button(btn_bar, text="重置为 1大3小",
+                   command=self._load_defaults).pack(side="left", padx=8)
 
-        # 参数区
-        par_box = ttk.LabelFrame(self, text=" 规则参数（按秒哒实际规则，可自行调整） ", padding=8)
-        par_box.pack(fill="x", pady=(10, 0))
+        # ===== 规则参数 =====
+        par_box = self._card(content, "规则参数", "按实际使用情况调整，改动自动保存")
+        par_box.pack(fill="x", pady=(0, 8))
+        grid = tk.Frame(par_box, bg=C_SURFACE)
+        grid.pack(fill="x", padx=16, pady=(0, 10))
         self.param_vars = {}
         for i, (key, label) in enumerate(PARAM_LABELS):
-            r, c = divmod(i, 4)
-            cell = ttk.Frame(par_box)
-            cell.grid(row=r, column=c, padx=8, pady=4, sticky="w")
-            ttk.Label(cell, text=label, width=16).pack(side="left")
+            r, c = divmod(i, 3)
+            cell = tk.Frame(grid, bg=C_SURFACE)
+            cell.grid(row=r, column=c, padx=(0, 16), pady=3, sticky="w")
+            ttk.Label(cell, text=label, width=16, style="Muted.TLabel").pack(side="left")
             v = tk.StringVar()
             ent = ttk.Entry(cell, textvariable=v, width=7)
             if key == "plan_days":
@@ -1077,23 +1191,33 @@ class App(tk.Tk):
                 v.trace_add("write", self._schedule_save)  # 参数改动也即时保存
             ent.pack(side="left")
             self.param_vars[key] = v
+        for c in range(3):
+            grid.columnconfigure(c, weight=1)
 
-        # 操作按钮
-        op = ttk.Frame(self)
-        op.pack(fill="x", pady=10)
-        ttk.Button(op, text="一键生成并采用", command=self.on_quick_adopt).pack(side="left")
-        ttk.Button(op, text="生成方案（先看再采用）", command=self.on_generate).pack(side="left", padx=6)
-        ttk.Button(op, text="查看当前方案", command=self.on_view_current).pack(side="left")
-        ttk.Button(op, text="查看加减明细", command=self.on_view_changes).pack(side="left")
-        ttk.Button(op, text="导出明细CSV", command=self.on_export).pack(side="left", padx=6)
-        ttk.Label(op, textvariable=self.save_status_var, foreground="#0a6").pack(side="left", padx=6)
+        # ===== 主操作栏 =====
+        op = tk.Frame(content, bg=C_BG)
+        op.pack(fill="x", pady=(4, 4))
+        ttk.Button(op, text="一键生成并采用", style="Primary.TButton",
+                   command=self.on_quick_adopt).pack(side="left")
+        ttk.Button(op, text="生成方案（先看再采用）",
+                   command=self.on_generate).pack(side="left", padx=8)
+        ttk.Button(op, text="查看当前方案",
+                   command=self.on_view_current).pack(side="left", padx=8)
+        ttk.Button(op, text="查看加减明细",
+                   command=self.on_view_changes).pack(side="left")
+        ttk.Button(op, text="导出明细CSV",
+                   command=self.on_export).pack(side="left", padx=8)
+        ttk.Label(op, textvariable=self.save_status_var,
+                  style="Bg.TLabel").pack(side="right")
 
-        # 方案不在主窗口拆分：生成后在独立窗口以单一页面完整展示
-        self.plan_tip = ttk.LabelFrame(self, text=" 方案 ", padding=8)
+        # 方案引导条：生成后使用，采用方案后自动隐藏
+        self.plan_tip = tk.Frame(content, bg="#EEF4FF", highlightthickness=1,
+                                 highlightbackground="#D5E3FF")
         self.plan_tip.pack(fill="x")
-        ttk.Label(self.plan_tip,
-                  text="最省事：点「一键生成并采用」即可。要看细项不用重新生成——点「查看当前方案」回看全文，点「查看加减明细」按日期/账号逐笔核对。负余额如实显示，不会被抹掉。",
-                  foreground="#666").pack(anchor="w")
+        tk.Label(self.plan_tip,
+                 text="最省事：点「一键生成并采用」。想看细项不用重新生成——点「查看当前方案」回看全文，点「查看加减明细」逐笔核对。",
+                 bg="#EEF4FF", fg="#475467", font=(FONT, 9), wraplength=940,
+                 justify="left").pack(anchor="w", padx=12, pady=6)
 
     # ---- 日期栏刷新 ----
     def _refresh_date_bar(self):
@@ -1265,7 +1389,7 @@ class App(tk.Tk):
             self.today_date_var.set("尚未采用方案")
             ttk.Label(self.today_lines,
                       text="生成方案后点「确认采用此方案」，这里会每天自动显示各号该做什么。",
-                      foreground="#888").pack(anchor="w")
+                      style="Muted.TLabel").pack(anchor="w")
             return
         try:
             pstart = datetime.date(int(plan["year"]), int(plan["month"]), int(plan["start_day"]))
@@ -1274,19 +1398,19 @@ class App(tk.Tk):
         except Exception:
             self.today_date_var.set("采用的方案数据异常")
             ttk.Label(self.today_lines, text="请重新生成方案并点「确认采用此方案」。",
-                      foreground="#c60").pack(anchor="w")
+                      style="Warn.TLabel", wraplength=520).pack(anchor="w")
             return
         self.today_date_var.set("今天是 %d年%d月%d日 %s ｜ 按已采用方案执行" %
                                 (now.year, now.month, now.day, WEEK_CN[now.weekday()]))
         if now < pstart:
             ttk.Label(self.today_lines,
                       text="今天不用操作，采用的方案从 %d月%d日 开始。" % (pstart.month, pstart.day),
-                      foreground="#666").pack(anchor="w")
+                      style="Muted.TLabel", wraplength=520).pack(anchor="w")
             return
         if now > pend:
             ttk.Label(self.today_lines,
                       text="方案已到 %d月%d日 结束，请重新生成并采用新方案。" % (pend.month, pend.day),
-                      foreground="#c60").pack(anchor="w")
+                      style="Warn.TLabel", wraplength=520).pack(anchor="w")
             return
         # 到期预警：平台优先消耗快到期的秒点（先获得的先扣），到期没用掉会自然流失
         def _expiry_warnings(day_obj):
@@ -1317,7 +1441,7 @@ class App(tk.Tk):
         day_actions = actions.get(str(now.day), {})
         warns = _expiry_warnings(now)
         if not day_actions and not warns:
-            ttk.Label(self.today_lines, text="今日无安排（休息日）。", foreground="#666").pack(anchor="w")
+            ttk.Label(self.today_lines, text="今日无安排（休息日）。", style="Muted.TLabel").pack(anchor="w")
             return
         bmap = plan.get("balance_curve") or {}
         prev = str(int(now.day) - 1)
@@ -1331,9 +1455,9 @@ class App(tk.Tk):
             except Exception:
                 pass
             txt = "· %s：%s%s" % (note, "、".join(acts) if acts else "静默（不登录、不操作）", extra)
-            ttk.Label(self.today_lines, text=txt).pack(anchor="w")
+            ttk.Label(self.today_lines, text=txt, wraplength=520).pack(anchor="w")
         for w in warns:
-            ttk.Label(self.today_lines, text=w, foreground="#c00").pack(anchor="w")
+            ttk.Label(self.today_lines, text=w, style="Danger.TLabel", wraplength=520).pack(anchor="w")
 
     # ---- 查看当前方案：确保快照里有完整全文（兼容旧方案）----
     def _ensure_plan_text(self, plan):
@@ -1648,7 +1772,7 @@ class App(tk.Tk):
     def add_row(self, role, idx, note, balance, login_claimed):
         row = AccountRow(self.acc_list, role, idx, note, balance, login_claimed,
                          on_delete=lambda r=None: None)
-        row.frame.pack(fill="x", pady=2)
+        row.frame.pack(fill="x", pady=4)
         if role == "small":
             row.frame.configure  # noqa
             # 重新绑定删除命令，带上自身引用
@@ -1779,22 +1903,35 @@ class App(tk.Tk):
 
         win = tk.Toplevel(self)
         self.plan_win = win
-        win.geometry("1000x800")
-        win.minsize(720, 520)
+        win.configure(bg=C_BG)
+        win.geometry("1040x860")
+        win.minsize(760, 560)
 
-        bar = ttk.Frame(win, padding=(10, 8))
+        bar = tk.Frame(win, bg=C_SURFACE, highlightthickness=1,
+                       highlightbackground=C_BORDER)
         bar.pack(fill="x")
+        brow = tk.Frame(bar, bg=C_SURFACE)
+        brow.pack(fill="x", padx=16, pady=10)
+        tk.Label(brow, text="方案", bg=C_SURFACE, fg=C_INK,
+                 font=(FONT, 12, "bold")).pack(side="left", padx=(0, 14))
         self.plan_status_var = tk.StringVar()
-        ttk.Label(bar, textvariable=self.plan_status_var, foreground="#0a6").pack(side="left")
-        ttk.Button(bar, text="关闭", command=self._close_plan).pack(side="right", padx=3)
-        ttk.Button(bar, text="复制全文", command=self._copy_plan).pack(side="right", padx=3)
-        ttk.Button(bar, text="导出明细CSV", command=self.on_export).pack(side="right", padx=3)
-        self._adopt_btn = ttk.Button(bar, text="确认采用此方案", command=self._adopt_plan)
+        ttk.Label(brow, textvariable=self.plan_status_var,
+                  style="Muted.TLabel").pack(side="left")
+        ttk.Button(brow, text="关闭", command=self._close_plan).pack(side="right", padx=3)
+        ttk.Button(brow, text="复制全文", command=self._copy_plan).pack(side="right", padx=3)
+        ttk.Button(brow, text="导出明细CSV",
+                   command=self.on_export).pack(side="right", padx=3)
+        self._adopt_btn = ttk.Button(brow, text="确认采用此方案",
+                                     style="Primary.TButton", command=self._adopt_plan)
 
-        body = ttk.Frame(win, padding=(10, 0, 10, 10))
-        body.pack(fill="both", expand=True)
-        txt = scrolledtext.ScrolledText(body, wrap="word", font=("Microsoft YaHei", 10),
-                                        padx=12, pady=10, spacing1=2, spacing3=2)
+        body = tk.Frame(win, bg=C_BG)
+        body.pack(fill="both", expand=True, padx=12, pady=12)
+        txt = scrolledtext.ScrolledText(body, wrap="word", font=(FONT, 10),
+                                        bg=C_SURFACE, fg=C_INK,
+                                        insertbackground=C_PRIMARY,
+                                        padx=18, pady=14, spacing1=2, spacing3=3,
+                                        highlightthickness=1,
+                                        highlightbackground=C_BORDER, relief="flat")
         txt.pack(fill="both", expand=True)
         txt.insert("1.0", text)
         txt.configure(state="disabled")  # 只读，防止误改方案
@@ -2041,33 +2178,47 @@ class App(tk.Tk):
         win = tk.Toplevel(self)
         self.detail_win = win
         win.title("加减明细 - %s" % APP_NAME)
-        win.geometry("1060x820")
-        win.minsize(760, 560)
+        win.configure(bg=C_BG)
+        win.geometry("1080x860")
+        win.minsize(780, 580)
 
-        bar = ttk.Frame(win, padding=(10, 8))
+        bar = tk.Frame(win, bg=C_SURFACE, highlightthickness=1,
+                       highlightbackground=C_BORDER)
         bar.pack(fill="x")
-        ttk.Label(bar, text="与平台余额逐笔核对", foreground="#0a6").pack(side="left")
-        ttk.Button(bar, text="关闭", command=self._close_detail).pack(side="right", padx=3)
-        ttk.Button(bar, text="复制全文", command=self._copy_detail).pack(side="right", padx=3)
-        ttk.Button(bar, text="导出明细CSV", command=self.on_export).pack(side="right", padx=3)
+        brow = tk.Frame(bar, bg=C_SURFACE)
+        brow.pack(fill="x", padx=16, pady=10)
+        tk.Label(brow, text="加减明细", bg=C_SURFACE, fg=C_INK,
+                 font=(FONT, 12, "bold")).pack(side="left", padx=(0, 14))
+        ttk.Label(brow, text="与平台余额逐笔核对",
+                  style="Muted.TLabel").pack(side="left")
+        ttk.Button(brow, text="关闭", command=self._close_detail).pack(side="right", padx=3)
+        ttk.Button(brow, text="复制全文", command=self._copy_detail).pack(side="right", padx=3)
+        ttk.Button(brow, text="导出明细CSV",
+                   command=self.on_export).pack(side="right", padx=3)
 
         # 视图切换工具条：分组方式 / 是否已发生，切换即重绘
-        tools = ttk.Frame(win, padding=(10, 0, 10, 6))
-        tools.pack(fill="x")
-        ttk.Label(tools, text="逐笔视图：").pack(side="left")
-        ttk.Radiobutton(tools, text="按日期", value="day", variable=self.detail_group_var,
+        tools = tk.Frame(win, bg=C_SURFACE, highlightthickness=1,
+                         highlightbackground=C_BORDER)
+        tools.pack(fill="x", padx=12, pady=(10, 0))
+        trow = tk.Frame(tools, bg=C_SURFACE)
+        trow.pack(fill="x", padx=12, pady=8)
+        ttk.Label(trow, text="逐笔视图：", style="Muted.TLabel").pack(side="left")
+        ttk.Radiobutton(trow, text="按日期", value="day", variable=self.detail_group_var,
                         command=self._refresh_detail_text).pack(side="left")
-        ttk.Radiobutton(tools, text="按账号", value="note", variable=self.detail_group_var,
+        ttk.Radiobutton(trow, text="按账号", value="note", variable=self.detail_group_var,
                         command=self._refresh_detail_text).pack(side="left", padx=(2, 12))
-        ttk.Radiobutton(tools, text="只看已发生", value="done", variable=self.detail_scope_var,
+        ttk.Radiobutton(trow, text="只看已发生", value="done", variable=self.detail_scope_var,
                         command=self._refresh_detail_text).pack(side="left")
-        ttk.Radiobutton(tools, text="全部(含未发生)", value="all", variable=self.detail_scope_var,
+        ttk.Radiobutton(trow, text="全部(含未发生)", value="all", variable=self.detail_scope_var,
                         command=self._refresh_detail_text).pack(side="left")
 
-        body = ttk.Frame(win, padding=(10, 0, 10, 10))
-        body.pack(fill="both", expand=True)
+        body = tk.Frame(win, bg=C_BG)
+        body.pack(fill="both", expand=True, padx=12, pady=12)
         txt = scrolledtext.ScrolledText(body, wrap="none", font=("Consolas", 10),
-                                        padx=12, pady=10)
+                                        bg=C_SURFACE, fg=C_INK,
+                                        insertbackground=C_PRIMARY,
+                                        padx=16, pady=14, highlightthickness=1,
+                                        highlightbackground=C_BORDER, relief="flat")
         txt.pack(fill="both", expand=True)
         txt.insert("1.0", text)
         txt.configure(state="disabled")
@@ -2304,7 +2455,7 @@ class App(tk.Tk):
         cfg = load_update_config()
         source = cfg.get("source") or UPDATE_MANIFEST_PRIMARY
         urls = _mirror_urls(source)
-        self.update_status.config(text="检查更新中…", fg="#aab7c4")
+        self.update_status.config(text="检查更新中…", fg="#94A3B8")
         self.update_btn.config(state=tk.DISABLED)
 
         def worker():
@@ -2319,15 +2470,15 @@ class App(tk.Tk):
     def _on_manifest(self, manifest, hit_source, manual):
         self.update_btn.config(state=tk.NORMAL)
         if not manifest:
-            self.update_status.config(text="检查失败（网络/地址）", fg="#aab7c4")
+            self.update_status.config(text="检查失败（网络/地址）", fg="#94A3B8")
             if manual:
                 messagebox.showwarning("检查更新", "暂时无法连接更新服务器，请稍后再试。")
             return
         latest = manifest.get("version", "0")
         self.update_status.config(text="线上 v%s · %s" % (latest, self._short_source(hit_source)),
-                                  fg="#aab7c4")
+                                  fg="#94A3B8")
         if cmp_version(latest, APP_VERSION) > 0:
-            self.update_status.config(fg="#ffd27f")   # 有新版本 → 橙色提示
+            self.update_status.config(fg="#FBBF24")   # 有新版本 → 橙色提示
             cfg = load_update_config()
             # 跳过此版本：仅启动检查生效，且只对该版本
             if (not manual) and cfg.get("skip_version") == latest:
@@ -2358,7 +2509,7 @@ class App(tk.Tk):
                                  if notes else "")
         self.banner_stage.config(text="")
         self.banner_pb.pack_forget()
-        self.banner.pack(fill="x")
+        self.banner.pack(fill="x", before=self._main_wrap)
         # 跳过此版本只对启动检查生效
         self.btn_skip.config(state=tk.DISABLED if manual else tk.NORMAL)
         self.btn_now.config(state=tk.NORMAL)
@@ -2420,17 +2571,19 @@ class App(tk.Tk):
     def _ask_restart(self):
         win = tk.Toplevel(self)
         win.title("更新完成")
-        win.geometry("360x150")
+        win.configure(bg=C_SURFACE)
+        win.geometry("400x170")
         win.transient(self)
-        tk.Label(win, text="新版本已安装完成！",
-                 font=("Microsoft YaHei", 12, "bold")).pack(pady=(16, 6))
-        tk.Label(win, text="是否立即重启以使用新版本？",
-                 font=("Microsoft YaHei", 10)).pack(pady=4)
-        bf = tk.Frame(win)
-        bf.pack(pady=10)
-        ttk.Button(bf, text="立即重启",
+        tk.Label(win, text="新版本已安装完成！", bg=C_SURFACE, fg=C_INK,
+                 font=(FONT, 13, "bold")).pack(pady=(22, 6))
+        tk.Label(win, text="是否立即重启以使用新版本？", bg=C_SURFACE, fg=C_MUTED,
+                 font=(FONT, 10)).pack(pady=4)
+        bf = tk.Frame(win, bg=C_SURFACE)
+        bf.pack(pady=12)
+        ttk.Button(bf, text="立即重启", style="Primary.TButton",
                    command=lambda: (win.destroy(), restart_app(self))).pack(side="left", padx=8)
-        ttk.Button(bf, text="稍后重启", command=win.destroy).pack(side="left", padx=8)
+        ttk.Button(bf, text="稍后重启",
+                   command=win.destroy).pack(side="left", padx=8)
 
     def _on_skip(self):
         v = getattr(self, "banner_version", None)
@@ -2448,7 +2601,7 @@ class App(tk.Tk):
         cfg["source"] = None
         save_update_config(cfg)
         self.restore_src_btn.pack_forget()
-        self.update_status.config(text="已恢复默认更新地址", fg="#aab7c4")
+        self.update_status.config(text="已恢复默认更新地址", fg="#94A3B8")
 
     def _on_close(self):
         # 取消尚未触发的防抖保存，避免销毁后回调报错

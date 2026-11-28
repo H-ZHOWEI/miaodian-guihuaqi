@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-秒点规划器 v1.16.0
+秒点规划器 v1.17.0
 根据每个账号当前秒点余额，模拟并生成「点赞 / 登录领奖 / 复制转账 / 打包」的执行方案。
 用 Python 3.12 + tkinter，可打包为单文件 exe。
 """
@@ -25,7 +25,7 @@ import datetime
 import calendar
 
 APP_NAME = "秒点规划器"
-VERSION = "1.16.0"
+VERSION = "1.17.0"
 APP_VERSION = VERSION   # 版本更新模块使用
 
 # ===== 内置「版本更新」配置 =====
@@ -379,6 +379,8 @@ DEFAULTS = {
     "backend_per_day": 20,  # 每个后端项目每天扣费
     "pack_cost": 300,       # 打包一次消耗
     "plan_days": 30,        # 规划天数（自动 = 今天到月末，运行时覆盖）
+    "copy_limit": 40,       # 单个作品累计复制上限：满40次后下线换新，超过后大号收不到点
+    "publish_cost": 20,     # 发布/上架一个新作品消耗的大号秒点
 }
 
 PARAM_LABELS = [
@@ -459,11 +461,32 @@ def _expire_stamp(year, month, day, days_in_month=None):
     return _date_stamp(year, month, day, days_in_month) + " 00:00"
 
 
-def simulate_small(ac, p, start_day=1, rest_days=None, cal=None):
+def _init_work_state(p, works=None):
+    """构造可变的作品状态副本：[{name, copies, active}, ...]。
+
+    works 为用户在界面维护的大号作品列表；缺省时按 work_count 生成默认作品。
+    copies 是累计被复制次数（用户手填 + 系统自动累计）；满 copy_limit 的作品
+    自动视为下线（active=False），不再分派复制，避免超过40次后大号白干。
+    """
+    limit = int(p.get("copy_limit", DEFAULTS["copy_limit"]))
+    if works:
+        out = []
+        for w in works:
+            cp = int(w.get("copies", 0) or 0)
+            out.append({"name": str(w.get("name", "作品")),
+                        "copies": cp, "start_copies": cp,
+                        "active": bool(w.get("active", True)) and cp < limit})
+        return out
+    return [{"name": "作品%d" % (i + 1), "copies": 0, "start_copies": 0, "active": True}
+            for i in range(max(1, int(p["work_count"])))]
+
+
+def simulate_small(ac, p, start_day=1, rest_days=None, cal=None, work_state=None):
     """模拟一个小号。返回 (copies, daily_events, author_income, end_balance, login_used, queue)
     start_day: 方案起始的真实日历日（今天几号），所有 day 均为日历日。
     rest_days: 周日集合，这些天零收入（不点赞、不登录、不复制），但秒点照常过期。
     cal: {"year","month","days"} 日历信息，供过期标注跨月显示真实日期；缺省按「N日」标注。
+    work_state: 大号作品状态（跨小号共享、原地累计复制次数）；缺省按作品数生成。
     """
     rest_days = rest_days or set()
     like_gain = p["like_gain"] * p["like_per_day"]
@@ -476,6 +499,8 @@ def simulate_small(ac, p, start_day=1, rest_days=None, cal=None):
     events = []       # 每日事件 list of (day, action, amount, balance)
     ptr = 0
     work_count = max(1, p["work_count"])
+    work_state = work_state if work_state is not None else _init_work_state(p)
+    limit = int(p.get("copy_limit", DEFAULTS["copy_limit"]))
     price = p["work_price"]
 
     def _bal():
@@ -522,10 +547,20 @@ def simulate_small(ac, p, start_day=1, rest_days=None, cal=None):
 
             made = 0
             while price > 0 and _total(queue) >= price:
+                # 只复制「在售且未达40次」的作品；满40次的下线，避免大号白干
+                avail = [i for i, w in enumerate(work_state)
+                         if w["active"] and w["copies"] < limit]
+                if not avail:
+                    break  # 全部作品已满，停止复制（提示需发布新作品）
+                wi = avail[ptr % len(avail)]
                 queue = _consume(queue, price)
-                wi = ptr % work_count
                 copies.append((d, wi + 1))
-                events.append((d, "复制→作品%d" % (wi + 1), -price, _bal()))
+                wname = work_state[wi]["name"]
+                work_state[wi]["copies"] += 1
+                work_state[wi].setdefault("_log", []).append(int(d))  # 供方案每日推进作品次数
+                if work_state[wi]["copies"] >= limit:
+                    work_state[wi]["active"] = False
+                events.append((d, "复制→%s" % wname, -price, _bal()))
                 ptr += 1
                 made += 1
                 if made > 1000:  # 保险
@@ -624,11 +659,12 @@ def simulate_big(ac, p, income_by_day, start_day=1, rest_days=None, pack_on_star
     return packs, events, _total(queue) - debt, login_granted, packable_days, queue
 
 
-def build_plan(accounts, p, ctx=None, pack_on_start=False):
+def build_plan(accounts, p, ctx=None, pack_on_start=False, works=None):
     """生成 (完整文本, csv行列表, 分板块列表, 每日动作表, 每日余额曲线, 每日登录曲线, 到期信息)。
     每日动作表: {日: {账号备注: [动作, ...]}}，供「确认采用」后主页面每日展示。
     余额/登录曲线: {日: {账号备注: 当天结束值}}，供采用后按日期自动推进当前秒点。
     到期信息: {账号备注: [(获得日, 过期日, 剩余点), ...]}，供到期预警与今日面板提醒。
+    works: 大号作品列表 [{name, copies, active}]；缺省按作品数生成默认作品。
     """
     ctx = ctx or month_context()
     start_day = ctx["start_day"]
@@ -643,13 +679,15 @@ def build_plan(accounts, p, ctx=None, pack_on_start=False):
         raise ValueError("缺少大号，请保留一个大号账号。")
     big = bigs[0]
 
-    # 先跑小号
+    # 先跑小号：作品状态跨所有小号共享、原地累计复制次数（满40次自动下线）
     cal = {"year": ctx["year"], "month": ctx["month"], "days": ctx["days_in_month"]}
+    work_state = _init_work_state(p, works)
+    copy_limit = int(p.get("copy_limit", DEFAULTS["copy_limit"]))
     small_results = []
     income_by_day = {}
     for ac in smalls:
         copies, ev, author_income, endbal, login_used, q = simulate_small(
-            ac, p, start_day, rest_days, cal=cal)
+            ac, p, start_day, rest_days, cal=cal, work_state=work_state)
         small_results.append((ac, copies, ev, author_income, endbal, login_used, q))
         per = p["work_price"] * (1 - p["copy_fee_pct"] / 100.0)
         for d, wi in copies:
@@ -793,6 +831,11 @@ def build_plan(accounts, p, ctx=None, pack_on_start=False):
             acts = day_map.setdefault(note, [])  # 静默号也占位，方便主页面逐号展示
             sec_daily.append("      %s：%s" % (note, "、".join(acts) if acts else "静默"))
 
+    # 作品名安全取用（索引 1-based）
+    def _wname(wi):
+        idx = int(wi) - 1
+        return work_state[idx]["name"] if 0 <= idx < len(work_state) else "作品%d" % wi
+
     # 板块4：小号复制排期
     for ac, copies, ev, ai, eb, lu, _q in small_results:
         sec_copy.append("【%s】当前 %g 点｜本月已领登录 %d 天（方案内再领 %d 天）" %
@@ -802,16 +845,39 @@ def build_plan(accounts, p, ctx=None, pack_on_start=False):
         if copies:
             txt = "  "
             for i, (d, wi) in enumerate(copies):
-                txt += "%d日→作品%d  " % (d, wi)
+                txt += "%d日→%s  " % (d, _wname(wi))
                 if (i + 1) % 5 == 0:
                     sec_copy.append(txt)
                     txt = "  "
             if txt.strip():
                 sec_copy.append(txt)
-            sec_copy.append("  （作品按 1→2→3→4 轮换，同一账号不会连续复制同一个作品）")
+            sec_copy.append("  （在售作品轮换，同一账号不会连续复制同一个作品）")
         else:
             sec_copy.append("  当前余额不足定价 %d，需先攒点。" % p["work_price"])
         sec_copy.append("")
+
+    # 作品复制进度：起始次数 + 方案内新增 = 月末累计；满40次的下线需换新
+    work_progress = []
+    for w in work_state:
+        start_cp = int(w.get("start_copies", w["copies"]))
+        end_cp = int(w["copies"])
+        work_progress.append({"name": w["name"], "start": start_cp,
+                              "added": end_cp - start_cp, "end": end_cp,
+                              "offline": (not w["active"]) or end_cp >= copy_limit})
+    offline_names = [w["name"] for w in work_progress if w["offline"]]
+    sec_work = []
+    sec_work.append("【大号作品复制进度】（单作品累计 %d 次后须下线换新，超过后大号收不到秒点）" % copy_limit)
+    for w in work_progress:
+        status = "⚠已满%d次·需下线换新" % copy_limit if w["offline"] else "在售"
+        sec_work.append("  · %s：起始 %d 次 + 方案内 %d 次 = 月末 %d 次｜%s" %
+                        (w["name"], w["start"], w["added"], w["end"], status))
+    if offline_names:
+        sec_work.append("  ★ %s 将满 %d 次，请在此之前发布/上架新作品接替（发布扣 %d 点）。" %
+                        ("、".join(offline_names), copy_limit,
+                         int(p.get("publish_cost", DEFAULTS["publish_cost"]))))
+    if work_progress and all(w["offline"] for w in work_progress):
+        sec_work.append("  ★ 全部作品已满：方案已停止复制安排，请先发布新作品再重新生成方案。")
+    sec_work.append("")
 
     # 板块5：大号与打包 + 汇总
     total_ai = sum(r[3] for r in small_results)
@@ -850,6 +916,7 @@ def build_plan(accounts, p, ctx=None, pack_on_start=False):
     L.append("=" * 58); L += sec_overview; L.append(""); L.append("=" * 58)
     L += sec_today; L.append("")
     L.append("【逐日行动预览】"); L += sec_daily; L.append("")
+    L += sec_work
     L += sec_copy
     L.append("-" * 58); L += sec_big
     full_text = "\n".join(L)
@@ -857,6 +924,7 @@ def build_plan(accounts, p, ctx=None, pack_on_start=False):
     sections = [
         ("今日行动", "\n".join(sec_overview) + "\n\n" + "\n".join(sec_today)),
         ("逐日行动", "\n".join(sec_daily)),
+        ("作品进度", "\n".join(sec_work)),
         ("复制排期", "\n".join(sec_copy)),
         ("大号与打包", "\n".join(sec_big)),
         ("全部", full_text),
@@ -885,7 +953,20 @@ def build_plan(accounts, p, ctx=None, pack_on_start=False):
         _fill_login_curve(login_curve, ac[0]["note"], start_lc, p, start_day, rest_days)
     _fill_login_curve(login_curve, big["note"], big_login_start, p, start_day, rest_days)
 
-    return full_text, rows, sections, actions_by_day, balance_curve, login_curve, expiry_info
+    # 作品复制曲线：{日历日: {作品名: 当日结束的累计复制次数}}，供采用方案后自动累计作品次数
+    work_copy_curve = {}
+    for w in work_state:
+        start_cp = int(w.get("start_copies", w["copies"]))
+        running = start_cp
+        by_day = {}
+        for d in w.get("_log", []):
+            by_day[d] = by_day.get(d, 0) + 1
+        for d in range(start_day, start_day + int(p["plan_days"])):
+            running += by_day.get(d, 0)
+            work_copy_curve.setdefault(d, {})[w["name"]] = running
+
+    return (full_text, rows, sections, actions_by_day, balance_curve,
+            login_curve, expiry_info, work_copy_curve)
 
 
 def _fill_login_curve(curve, note, start_claimed, p, start_day, rest_days):
@@ -900,7 +981,7 @@ def _fill_login_curve(curve, note, start_claimed, p, start_day, rest_days):
         curve.setdefault(d, {})[note] = claimed
 
 
-def _eval_price(accounts, p, ctx, price):
+def _eval_price(accounts, p, ctx, price, works=None):
     """在给定统一定价下，用现有 simulate_small 评估各小号：返回过期浪费/复制次数/大号实收。"""
     cal = {"year": ctx["year"], "month": ctx["month"], "days": ctx["days_in_month"]}
     rest_days = ctx.get("rest_days", set())
@@ -913,7 +994,9 @@ def _eval_price(accounts, p, ctx, price):
     for ac in accounts:
         if ac["role"] != "small":
             continue
-        cp, ev, ai, _eb, _lu, _q = simulate_small(ac, pp, start_day, rest_days, cal=cal)
+        # 每个小号用独立作品副本评估（互不影响），并计入40次上限造成的复制损失
+        ws = _init_work_state(pp, works)
+        cp, ev, ai, _eb, _lu, _q = simulate_small(ac, pp, start_day, rest_days, cal=cal, work_state=ws)
         copies += len(cp)
         income += ai
         for _d, act, amt, _bal in ev:
@@ -922,7 +1005,7 @@ def _eval_price(accounts, p, ctx, price):
     return {"waste": round(waste, 2), "copies": int(copies), "income": round(income, 2)}
 
 
-def recommend_price(accounts, p, ctx=None):
+def recommend_price(accounts, p, ctx=None, works=None):
     """为大号作品推荐一个统一上架秒点（方案期内固定，不中途改价）。
 
     综合每个小号当前秒点与即将失效批次：枚举候选定价，复用同一套 simulate_small 模拟，
@@ -949,13 +1032,13 @@ def recommend_price(accounts, p, ctx=None):
 
     results = []
     for cand in candidates:
-        r = _eval_price(accounts, pp, ctx, cand)
+        r = _eval_price(accounts, pp, ctx, cand, works=works)
         r["price"] = cand
         results.append(r)
 
     best = min(results, key=lambda r: (r["waste"], r["copies"]))
     current_price = int(p["work_price"])
-    current = _eval_price(accounts, pp, ctx, current_price)
+    current = _eval_price(accounts, pp, ctx, current_price, works=works)
     current["price"] = current_price
 
     if best["waste"] <= 0.005:
@@ -1026,6 +1109,40 @@ class AccountRow:
                 "balance": bal, "login_claimed": lc}
 
 
+class WorkRow:
+    """大号作品一行：名称 + 累计复制次数（可手改，系统也会自动累计）。"""
+    def __init__(self, parent, name="作品", copies=0, idx=1, on_delete=None):
+        self.frame = tk.Frame(parent, bg=C_SURFACE, highlightthickness=1,
+                              highlightbackground=C_BORDER)
+        self.name_var = tk.StringVar(value=name)
+        self.copies_var = tk.StringVar(value=str(copies))
+        self.idx = idx
+        tk.Label(self.frame, text="作品%d" % idx, bg="#EEF2FF", fg="#4338CA",
+                 font=(FONT, 10, "bold"), pady=2).grid(row=0, column=0, padx=(10, 8), pady=2)
+        tk.Label(self.frame, text="名称", bg=C_SURFACE, fg=C_MUTED,
+                 font=(FONT, 9)).grid(row=0, column=1, padx=(0, 4))
+        ttk.Entry(self.frame, textvariable=self.name_var, width=16).grid(
+            row=0, column=2, padx=(0, 14), sticky="w")
+        tk.Label(self.frame, text="累计复制(次)", bg=C_SURFACE, fg=C_MUTED,
+                 font=(FONT, 9)).grid(row=0, column=3, padx=(0, 4))
+        ttk.Spinbox(self.frame, from_=0, to=9999, textvariable=self.copies_var,
+                    width=6).grid(row=0, column=4, sticky="w")
+        self.status_var = tk.StringVar(value="")
+        tk.Label(self.frame, textvariable=self.status_var, bg=C_SURFACE, fg=C_WARN,
+                 font=(FONT, 9)).grid(row=0, column=5, padx=(12, 4), sticky="w")
+        self.del_btn = ttk.Button(self.frame, text="删除", width=6, style="Ghost.TButton",
+                                  command=on_delete)
+        self.del_btn.grid(row=0, column=6, padx=(12, 10))
+
+    def to_dict(self):
+        try:
+            cp = int(self.copies_var.get() or 0)
+        except ValueError:
+            cp = 0
+        return {"name": self.name_var.get().strip() or "作品",
+                "copies": cp, "active": cp < int(DEFAULTS["copy_limit"])}
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -1034,10 +1151,13 @@ class App(tk.Tk):
         self.minsize(940, 860)
         self.rows = []
         self.small_counter = 0
+        self.work_rows = []        # 大号作品行 [{name_var, copies_var, frame}]
         self.last_rows = None
         self.pending_plan = None   # 最近生成、尚未确认采用的方案快照
         self.adopted_plan = None   # 已确认采用的方案（持久化，主页面每日展示）
         self.change_log = []       # 实际加减记录（每次推进/回退逐条记，供核对）
+        self.manual_batches = []   # 快捷操作产生的大号收款批次 [{date, amount, name, note}]
+        self.quick_note_var = tk.StringVar(value="")  # 快捷操作当前选中的账号备注
         self.detail_group_var = tk.StringVar(value="day")   # 逐笔核对：按日期 / 按账号
         self.detail_scope_var = tk.StringVar(value="done")  # 逐笔核对：只看已发生 / 全部
         self.today_done_var = tk.BooleanVar(value=False)  # 今天是否已全部操作过
@@ -1249,6 +1369,45 @@ class App(tk.Tk):
                        selectcolor="#FFFFFF", font=(FONT, 10), anchor="w",
                        command=self._on_switch_changed).pack(anchor="w", pady=2)
 
+        # ===== 快捷操作：选账号 → 一键记一笔实际发生的操作（带7天过期）=====
+        qbox = self._card(content, "快捷操作", "实际做了什么就点一下，秒点与到期自动记")
+        qbox.pack(fill="x", pady=(0, 8))
+        qrow = tk.Frame(qbox, bg=C_SURFACE)
+        qrow.pack(fill="x", padx=16, pady=(0, 6))
+        ttk.Label(qrow, text="选择账号", style="Muted.TLabel").pack(side="left")
+        self.quick_combo = ttk.Combobox(qrow, textvariable=self.quick_note_var,
+                                        state="readonly", width=14)
+        self.quick_combo.pack(side="left", padx=(4, 14))
+        self.quick_combo.bind("<<ComboboxSelected>>", lambda e: self._refresh_work_combo())
+        ttk.Button(qrow, text="发布应用（-20，仅大号）",
+                   command=self.on_publish_app).pack(side="left")
+        ttk.Button(qrow, text="已点赞20次（+点）",
+                   command=self.on_quick_like).pack(side="left", padx=8)
+        ttk.Button(qrow, text="已复制大号作品",
+                   command=self.on_quick_copy).pack(side="left")
+        qhint = tk.Frame(qbox, bg=C_SURFACE)
+        qhint.pack(fill="x", padx=16, pady=(0, 8))
+        self.quick_hint_var = tk.StringVar(value="")
+        ttk.Label(qhint, textvariable=self.quick_hint_var,
+                  style="Muted.TLabel", wraplength=920, justify="left").pack(anchor="w")
+
+        # ===== 大号作品：名称 + 累计复制次数（满40需下线换新）=====
+        wbox = self._card(content, "大号作品", "满40次须下线换新；系统按方案自动累计")
+        wbox.pack(fill="x", pady=(0, 8))
+        wholder = tk.Frame(wbox, bg=C_SURFACE)
+        wholder.pack(fill="x", padx=16, pady=(0, 8))
+        self.work_list = tk.Frame(wholder, bg=C_SURFACE)
+        self.work_list.pack(fill="x")
+        self.work_tip_var = tk.StringVar(value="")
+        ttk.Label(wholder, textvariable=self.work_tip_var,
+                  style="Warn.TLabel", wraplength=920, justify="left").pack(anchor="w", pady=(6, 0))
+        wbar = tk.Frame(wholder, bg=C_SURFACE)
+        wbar.pack(fill="x", pady=(8, 0))
+        ttk.Button(wbar, text="＋ 添加作品", command=self.add_work).pack(side="left")
+        self.work_auto_var = tk.StringVar(value="")
+        ttk.Label(wbar, textvariable=self.work_auto_var,
+                  style="Ok.TLabel", wraplength=680, justify="left").pack(side="left", padx=12)
+
         # ===== 账号 =====
         acc_box = self._card(content, "账号", "可增删小号、改备注与当前秒点")
         acc_box.pack(fill="x", pady=(0, 8))
@@ -1400,6 +1559,28 @@ class App(tk.Tk):
             parts.append("⚠ 7天内到期：" + "；".join(chunks) + "（没用掉会流失）")
         else:
             parts.append("7天内无秒点到期")
+
+        # 快捷操作产生的大号收款批次：按到期日展示（如3个小号同日复制→240点7天后到期）
+        mb_due = {}
+        for b in getattr(self, "manual_batches", []):
+            try:
+                exp = datetime.date.fromisoformat(b["expire"])
+                left = (exp - today).days
+                if 0 <= left <= 7:
+                    mb_due.setdefault(exp, []).append((b.get("name", "作品"), float(b["amount"]),
+                                                        b.get("from", "")))
+            except Exception:
+                continue
+        if mb_due:
+            chunks = []
+            for exp in sorted(mb_due)[:2]:
+                items = mb_due[exp]
+                total = round(sum(a for _, a, _ in items), 2)
+                names = "、".join("%s%g点" % (n, a) for n, a, _ in items[:3])
+                if len(items) > 3:
+                    names += "等%d笔" % len(items)
+                chunks.append("%s 共%g点（%s）" % (exp.strftime("%Y-%m-%d 00:00"), total, names))
+            parts.append("⚠ 大号快捷收款到期：" + "；".join(chunks) + "（没用掉会流失）")
 
         # 打包机会：大号日终余额首次达到打包线的日期
         big_note = None
@@ -1587,8 +1768,9 @@ class App(tk.Tk):
                 "weekday": WEEK_CN[datetime.date(py, pm, ps).weekday()],
                 "today_done": False,
             }
-            text, rows, _secs, _acts, _bal, _login, _exp = build_plan(
-                restored, p, ctx, pack_on_start=bool(plan.get("packed_on_start", False)))
+            text, rows, _secs, _acts, _bal, _login, _exp, _wcc = build_plan(
+                restored, p, ctx, pack_on_start=bool(plan.get("packed_on_start", False)),
+                works=plan.get("works") or getattr(self, "works", None))
             plan["text"] = text
             plan["rows"] = rows
             self._auto_save()
@@ -1616,8 +1798,9 @@ class App(tk.Tk):
                 "plan_days": max(1, pe - ps + 1), "rest_days": rest,
                 "weekday": WEEK_CN[plan_start.weekday()], "today_done": False,
             }
-            _text, _rows, _secs, _acts, bal_curve, login_curve, _exp = build_plan(
-                accounts, p, ctx, pack_on_start=bool(plan.get("packed_on_start", False)))
+            _text, _rows, _secs, _acts, bal_curve, login_curve, _exp, _wcc = build_plan(
+                accounts, p, ctx, pack_on_start=bool(plan.get("packed_on_start", False)),
+                works=plan.get("works") or getattr(self, "works", None))
             plan["balance_curve"] = {str(d): dict(v) for d, v in bal_curve.items()}
             plan["login_curve"] = {str(d): dict(v) for d, v in login_curve.items()}
             plan["start_bal"] = {a["note"]: float(a["balance"]) for a in accounts}
@@ -1763,6 +1946,36 @@ class App(tk.Tk):
                         "reason": "、".join(acts) if acts else direction,
                         "direction": direction,
                     })
+            # 作品累计复制次数按方案曲线推进（用增量，保留用户手改/快捷操作累加的值）
+            wc_curve = plan.get("work_copy_curve") or {}
+            plan_works = plan.get("works") or []
+            if wc_curve and plan_works:
+                plan_names = {str(w.get("name", "")) for w in plan_works}
+                def _wbase(name):
+                    for w in plan_works:
+                        if str(w.get("name", "")) == name:
+                            try:
+                                return int(w.get("copies", 0))
+                            except Exception:
+                                return 0
+                    return 0
+                def wval(d, flag, name):
+                    if d < ps or not _eod(d, flag):
+                        return _wbase(name)
+                    v = (wc_curve.get(str(d)) or {}).get(name)
+                    return _wbase(name) if v is None else int(round(float(v)))
+                for wrow in getattr(self, "work_rows", []):
+                    wname = wrow.name_var.get().strip()
+                    if not wname or wname not in plan_names:
+                        continue
+                    wdelta = wval(target, tgt_eod, wname) - wval(last, prev_eod, wname)
+                    if wdelta:
+                        try:
+                            wcur = int(wrow.copies_var.get() or 0)
+                        except ValueError:
+                            wcur = 0
+                        wrow.copies_var.set(str(max(0, wcur + wdelta)))
+                        changed = True
         finally:
             self._binding_saves = False
 
@@ -1861,6 +2074,311 @@ class App(tk.Tk):
         except Exception:
             pass
 
+    # ---- 大号作品管理 ----
+    def _collect_works(self):
+        return [w.to_dict() for w in getattr(self, "work_rows", [])]
+
+    def add_work(self, name=None, copies=0):
+        idx = len(self.work_rows) + 1
+        name = name or ("作品%d" % idx)
+        w = WorkRow(self.work_list, name=name, copies=copies, idx=idx,
+                    on_delete=lambda rr=None: None)
+        w.frame.pack(fill="x", pady=3)
+        for _w in self.work_rows:
+            _w.del_btn.configure(command=lambda rr=_w: self.delete_work(rr))
+        w.del_btn.configure(command=lambda rr=w: self.delete_work(rr))
+        for var in (w.name_var, w.copies_var):
+            var.trace_add("write", self._on_work_changed)
+        self.work_rows.append(w)
+        self._refresh_work_status()
+        self._schedule_save()
+        return w
+
+    def delete_work(self, w):
+        if w in self.work_rows:
+            self.work_rows.remove(w)
+            w.frame.destroy()
+            for i, rw in enumerate(self.work_rows):
+                rw.idx = i + 1
+                lbl = rw.frame.grid_slaves(row=0, column=0)
+                if lbl:
+                    lbl[0].configure(text="作品%d" % (i + 1))
+                rw.del_btn.configure(command=lambda rr=rw: self.delete_work(rr))
+        self._refresh_work_status()
+        self._schedule_save()
+
+    def _on_work_changed(self, *args):
+        if getattr(self, "_binding_saves", False):
+            return
+        self._refresh_work_status()
+        self._schedule_save()
+
+    def _refresh_work_status(self):
+        """作品行状态与顶部提示：满40次标红并提示换新。"""
+        limit = int(DEFAULTS["copy_limit"])
+        full = []
+        try:
+            for w in self.work_rows:
+                try:
+                    cp = int(w.copies_var.get() or 0)
+                except ValueError:
+                    cp = 0
+                if cp >= limit:
+                    w.status_var.set("⚠已满%d次·需换新" % limit)
+                    full.append(w.name_var.get().strip() or "作品")
+                else:
+                    w.status_var.set("剩余 %d 次" % (limit - cp))
+        except Exception:
+            pass
+        if hasattr(self, "work_tip_var"):
+            if full:
+                self.work_tip_var.set("⚠ %s 累计已达 %d 次，继续复制大号收不到秒点；请点「发布应用」上新作品接替。"
+                                      % ("、".join(full), limit))
+            else:
+                self.work_tip_var.set("规则：单作品累计复制满 %d 次须下线换新（超过后大号收不到秒点）；"
+                                      "生成方案时会自动跳过已满的作品。" % limit)
+
+    def _refresh_account_combo(self):
+        """刷新快捷操作的账号下拉（备注 + 角色）。"""
+        if not hasattr(self, "quick_combo"):
+            return
+        vals = []
+        for r in getattr(self, "rows", []):
+            note = r.note_var.get().strip() or r.role_var.get()
+            vals.append(note)
+        old = self.quick_note_var.get()
+        self.quick_combo["values"] = vals
+        if vals:
+            # 优先保留原选择，否则默认选第一个小号，没有小号则选大号
+            if old in vals:
+                self.quick_note_var.set(old)
+            else:
+                small = next((r.note_var.get().strip() or r.role_var.get()
+                              for r in self.rows if r.role == "small"), None)
+                self.quick_note_var.set(small or vals[0])
+        else:
+            self.quick_note_var.set("")
+        self._refresh_quick_hint()
+
+    def _find_row_by_note(self, note):
+        for r in getattr(self, "rows", []):
+            if (r.note_var.get().strip() or r.role_var.get()) == note:
+                return r
+        return None
+
+    def _refresh_quick_hint(self, msg=None):
+        if not hasattr(self, "quick_hint_var"):
+            return
+        if msg:
+            self.quick_hint_var.set(msg)
+            return
+        note = self.quick_note_var.get()
+        r = self._find_row_by_note(note) if note else None
+        if not note or not r:
+            self.quick_hint_var.set("先在上方下拉选择账号；实际在平台做了操作，就点对应按钮记一笔，"
+                                    "秒点增减与7天到期自动记录。")
+        elif r.role == "big":
+            self.quick_hint_var.set("当前：%s（大号）。可点「发布应用」扣 %d 点上新作品，也可记点赞；"
+                                    "大号收到的小号复制款会记在【大号收款批次】并按7天到期。"
+                                    % (note, int(DEFAULTS["publish_cost"])))
+        else:
+            self.quick_hint_var.set("当前：%s（小号）。点赞按每次 %d 点记 %d 次；复制按每个作品 %d 点扣，"
+                                    "大号实收 %g 点并按7天到期。"
+                                    % (note, int(DEFAULTS["like_gain"]),
+                                       int(DEFAULTS["like_per_day"]),
+                                       int(self.param_vars["work_price"].get() or 0),
+                                       int(self.param_vars["work_price"].get() or 0)
+                                       * (1 - float(self.param_vars["copy_fee_pct"].get() or 0) / 100.0)))
+
+    def _read_param(self, key, default):
+        try:
+            v = float(self.param_vars[key].get())
+            return int(v) if v == int(v) else v
+        except Exception:
+            return default
+
+    def _log_manual(self, note, delta, reason, big_gain=0.0, work_name="", from_note=""):
+        """记一笔快捷操作：改账号余额 + change_log + （大号收款）手动批次。"""
+        r = self._find_row_by_note(note)
+        if r is None:
+            return False
+        try:
+            cur = float(r.bal_var.get() or 0)
+        except ValueError:
+            cur = 0.0
+        newv = round(cur + delta, 2)
+        self._binding_saves = True
+        try:
+            r.bal_var.set("%g" % newv)
+        finally:
+            self._binding_saves = False
+        today = datetime.date.today()
+        self._append_change_log([{
+            "ts": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "day": today.day, "note": note, "delta": round(delta, 2),
+            "before": round(cur, 2), "after": newv, "login_delta": 0,
+            "reason": reason, "direction": "快捷操作", "source": "manual",
+        }])
+        if big_gain > 0:
+            expire_days = int(self._read_param("expiry_days", DEFAULTS["expiry_days"]))
+            self.manual_batches.append({
+                "date": today.isoformat(),
+                "amount": round(big_gain, 2),
+                "name": work_name, "from": from_note or note,
+                "expire": (today + datetime.timedelta(days=expire_days)).isoformat(),
+            })
+        return True
+
+    def on_publish_app(self):
+        """发布/上架新作品：仅大号可点，扣 publish_cost 点并新增一个空作品。"""
+        note = self.quick_note_var.get()
+        r = self._find_row_by_note(note) if note else None
+        if r is None:
+            messagebox.showwarning("提示", "请先在下拉框选择账号。", parent=self)
+            return
+        if r.role != "big":
+            messagebox.showwarning("仅大号可用", "「发布应用」只有大号可以操作，请切换到大号。", parent=self)
+            return
+        cost = int(DEFAULTS["publish_cost"])
+        try:
+            cur = float(r.bal_var.get() or 0)
+        except ValueError:
+            cur = 0.0
+        if cur < cost:
+            if not messagebox.askyesno("余额不足",
+                                       "大号当前 %g 点，发布需 %d 点，发布后会变成负数（欠费）。仍要记录吗？"
+                                       % (cur, cost), parent=self):
+                return
+        name = "新作品%d" % (len(self.work_rows) + 1)
+        self._log_manual(note, -cost, "发布应用-%d" % cost)
+        self.add_work(name=name, copies=0)
+        self._auto_save()
+        self._refresh_quick_hint("已在平台发布「%s」并记录：%s -%d 点；新作品累计复制从 0 开始。"
+                                 % (name, note, cost))
+
+    def on_quick_like(self):
+        """已点赞20次：选中账号按 like_gain×like_per_day 加秒点，记7天到期。"""
+        note = self.quick_note_var.get()
+        r = self._find_row_by_note(note) if note else None
+        if r is None:
+            messagebox.showwarning("提示", "请先在下拉框选择账号。", parent=self)
+            return
+        per = self._read_param("like_gain", DEFAULTS["like_gain"])
+        cnt = int(self._read_param("like_per_day", DEFAULTS["like_per_day"]))
+        gain = per * cnt
+        if gain <= 0:
+            messagebox.showwarning("参数异常", "每次点赞与每日点赞次数需为正数。", parent=self)
+            return
+        self._log_manual(note, gain, "已点赞%d次+%g" % (cnt, gain))
+        self._auto_save()
+        expire_days = int(self._read_param("expiry_days", DEFAULTS["expiry_days"]))
+        self._refresh_quick_hint("已记录：%s 点赞 %d 次 +%g 点，这批秒点将于 %s 到期（%d天）。"
+                                 % (note, cnt, gain,
+                                    (datetime.date.today() + datetime.timedelta(days=expire_days)).isoformat(),
+                                    expire_days))
+
+    def on_quick_copy(self):
+        """已复制大号作品：小号扣定价，大号加实收并记7天到期；作品累计次数+1。"""
+        note = self.quick_note_var.get()
+        r = self._find_row_by_note(note) if note else None
+        if r is None:
+            messagebox.showwarning("提示", "请先在下拉框选择账号。", parent=self)
+            return
+        works = self._collect_works()
+        if not works:
+            messagebox.showwarning("没有作品", "请先在「大号作品」里添加作品。", parent=self)
+            return
+        limit = int(DEFAULTS["copy_limit"])
+        avail = [w for w in works if w["copies"] < limit]
+        if not avail:
+            messagebox.showwarning("作品已满",
+                                   "全部作品累计复制已达 %d 次，继续复制大号收不到秒点；请先点「发布应用」上新作品。"
+                                   % limit, parent=self)
+            return
+        # 弹出选择作品
+        choice = self._ask_copy_work(avail, limit)
+        if not choice:
+            return
+        work = choice
+        price = self._read_param("work_price", DEFAULTS["work_price"])
+        fee = self._read_param("copy_fee_pct", DEFAULTS["copy_fee_pct"])
+        gain = round(price * (1 - fee / 100.0), 2)
+        is_big = (r.role == "big")
+        if is_big:
+            # 大号自己复制不产生自己的转账收入，只扣定价（异常情况如实记）
+            self._log_manual(note, -price, "复制%s-%g（大号自复制不计收款）" % (work["name"], price))
+            self._auto_save()
+            self._refresh_quick_hint("已记录：%s 复制「%s」-%g 点（大号自复制不产生自己的收款）。"
+                                     % (note, work["name"], price))
+            return
+        # 小号复制：小号扣定价；大号加实收并记收款批次
+        self._log_manual(note, -price, "复制%s-%g" % (work["name"], price))
+        big_note = None
+        for rr in self.rows:
+            if rr.role == "big":
+                big_note = rr.note_var.get().strip() or rr.role_var.get()
+                break
+        if big_note:
+            self._log_manual(big_note, gain, "收款:%s(来自%s)" % (work["name"], note),
+                             big_gain=gain, work_name=work["name"], from_note=note)
+        # 作品累计次数+1
+        for w in self.work_rows:
+            if (w.name_var.get().strip() or "作品") == work["name"]:
+                try:
+                    cp = int(w.copies_var.get() or 0)
+                except ValueError:
+                    cp = 0
+                self._binding_saves = True
+                try:
+                    w.copies_var.set(str(cp + 1))
+                finally:
+                    self._binding_saves = False
+                break
+        self._refresh_work_status()
+        self._auto_save()
+        expire_days = int(self._read_param("expiry_days", DEFAULTS["expiry_days"]))
+        self._refresh_quick_hint("已记录：%s 复制「%s」-%g 点；大号 +%g 点，将于 %s 到期（%d天）；"
+                                 "作品累计 %d 次。"
+                                 % (note, work["name"], price, gain,
+                                    (datetime.date.today() + datetime.timedelta(days=expire_days)).isoformat(),
+                                    expire_days, work["copies"] + 1))
+
+    def _ask_copy_work(self, avail, limit):
+        """简易对话框：选择一个作品（含当前累计次数），返回该作品 dict。"""
+        win = tk.Toplevel(self)
+        win.title("选择复制的作品")
+        win.transient(self)
+        win.grab_set()
+        win.resizable(False, False)
+        tk.Label(win, text="选择小号刚复制的大号作品", font=(FONT, 11, "bold"),
+                 bg=C_SURFACE, fg=C_INK).pack(padx=18, pady=(14, 6))
+        tk.Label(win, text="累计已满 %d 次的作品不会出现在列表里（复制也收不到点）。" % limit,
+                 font=(FONT, 9), bg=C_SURFACE, fg=C_MUTED).pack(padx=18, pady=(0, 8))
+        opts = ["%s（已复制 %d 次）" % (w["name"], w["copies"]) for w in avail]
+        name_to_opt = {w["name"]: o for w, o in zip(avail, opts)}
+        cb = ttk.Combobox(win, values=opts, state="readonly", width=28)
+        cb.set(opts[0])
+        cb.pack(padx=18, pady=4)
+        bfr = tk.Frame(win)
+        bfr.pack(pady=(8, 14))
+        result = {"work": None}
+
+        def _ok():
+            chosen = cb.get()
+            for w in avail:
+                if name_to_opt.get(w["name"]) == chosen:
+                    result["work"] = w
+                    break
+            win.destroy()
+
+        ttk.Button(bfr, text="确定", style="Primary.TButton", command=_ok).pack(side="left", padx=6)
+        ttk.Button(bfr, text="取消", command=win.destroy).pack(side="left")
+        self.wait_window(win)
+        return result["work"]
+
+    def _refresh_work_combo(self):
+        self._refresh_quick_hint()
+
     # ---- 账号行管理 ----
     def add_row(self, role, idx, note, balance, login_claimed):
         row = AccountRow(self.acc_list, role, idx, note, balance, login_claimed,
@@ -1907,7 +2425,15 @@ class App(tk.Tk):
         for i in range(3):
             self.add_small()
         for k, v in DEFAULTS.items():
-            self.param_vars[k].set(str(v))
+            if k in self.param_vars:
+                self.param_vars[k].set(str(v))
+        # 重建作品列表（默认4个）
+        for w in list(getattr(self, "work_rows", [])):
+            w.frame.destroy()
+        self.work_rows = []
+        for i in range(4):
+            self.add_work(name="作品%d" % (i + 1), copies=0)
+        self._refresh_account_combo()
         self.today_done_var.set(False)
         self.pack_today_var.set(False)
         self._refresh_date_bar()
@@ -1932,8 +2458,9 @@ class App(tk.Tk):
     def _make_plan_snapshot(self):
         """按当前界面生成一份完整方案快照（不弹窗、不采用）。"""
         accounts, p = self.collect()
-        text, rows, _sections, actions, balance_curve, login_curve, expiry = build_plan(
-            accounts, p, self.ctx, pack_on_start=self.pack_today_var.get())
+        works = self._collect_works()
+        text, rows, _sections, actions, balance_curve, login_curve, expiry, work_copy_curve = build_plan(
+            accounts, p, self.ctx, pack_on_start=self.pack_today_var.get(), works=works)
         self.last_rows = rows
         c = self.ctx
         return {
@@ -1949,6 +2476,8 @@ class App(tk.Tk):
             "start_login": {a["note"]: int(a.get("login_claimed", 0)) for a in accounts},
             "login_cap": int(p["login_days_cap"]),
             "packed_on_start": bool(self.pack_today_var.get()),
+            "works": works,                     # 方案采用时的作品快照（名称/累计次数）
+            "work_copy_curve": {str(d): dict(v) for d, v in work_copy_curve.items()},
         }
 
     def on_generate(self):
@@ -2243,8 +2772,35 @@ class App(tk.Tk):
                     continue
             lines.append("  （仅显示最近 80 条，共 %d 条存档。）" % len(log))
         lines.append("")
+
+        # ---- 五、大号收款批次（快捷操作产生，带7天到期） ----
+        lines.append("【五】大号收款批次（小号复制产生，按发生日+有效期到期）")
+        lines.append("-" * W)
+        mb = getattr(self, "manual_batches", [])
+        if not isinstance(mb, list) or not mb:
+            lines.append("  （暂无记录。点「已复制大号作品」后，大号收到的秒点会按笔记录发生日与到期时间。）")
+        else:
+            today = datetime.date.today()
+            for b in mb[-80:]:
+                try:
+                    exp = datetime.date.fromisoformat(b["expire"])
+                    left = (exp - today).days
+                    if left < 0:
+                        status = "已到期"
+                    elif left == 0:
+                        status = "⚠今天到期"
+                    else:
+                        status = "%d天后到期" % left
+                    lines.append("  %s  复制「%s」由 %s 贡献  +%g 点  → 到期 %s 00:00（%s）" % (
+                        b.get("date", ""), b.get("name", ""), b.get("from", ""),
+                        float(b["amount"]), exp.isoformat(), status))
+                except Exception:
+                    continue
+            lines.append("  （仅显示最近 80 条，共 %d 笔存档。）" % len(mb))
+        lines.append("")
         lines.append("核对方法：先看【一】当前值是否与平台一致；不一致时对照【二】找原因，")
-        lines.append("再用【三】逐笔「上笔→变动→本笔」定位哪一笔，最后用【四】看软件实际改了多少。")
+        lines.append("再用【三】逐笔「上笔→变动→本笔」定位哪一笔，最后用【四】看软件实际改了多少；")
+        lines.append("【五】看快捷操作产生的大号收款什么时候到期（如三个小号同日复制共240点，7天后同时到期）。")
         return "\n".join(lines)
 
     def _refresh_detail_text(self, *args):
@@ -2302,7 +2858,7 @@ class App(tk.Tk):
         """计算并展示作品上架秒点推荐。"""
         try:
             accounts, p = self.collect()
-            r = recommend_price(accounts, p, self.ctx)
+            r = recommend_price(accounts, p, self.ctx, works=self._collect_works())
             if not r or not r.get("ok"):
                 messagebox.showinfo("无法推荐",
                                     "请保留至少一个小号，再计算作品上架推荐。", parent=self)
@@ -2591,6 +3147,8 @@ class App(tk.Tk):
         data["pack_today"] = bool(self.pack_today_var.get())
         data["adopted_plan"] = getattr(self, "adopted_plan", None)
         data["change_log"] = getattr(self, "change_log", [])
+        data["works"] = self._collect_works()
+        data["manual_batches"] = getattr(self, "manual_batches", [])
         try:
             with open(self.config_path(), "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
@@ -2630,10 +3188,27 @@ class App(tk.Tk):
             self.add_row("big", 0, "大号", 0, 0)
         # 先用默认值填满，再用配置里的值覆盖，避免残缺配置导致参数框为空
         for k, v in DEFAULTS.items():
-            self.param_vars[k].set(str(v))
+            if k in self.param_vars:
+                self.param_vars[k].set(str(v))
         for k, v in data.get("params", {}).items():
             if k in self.param_vars and str(v).strip() != "":
                 self.param_vars[k].set(str(v))
+        # 恢复大号作品列表（兼容旧配置缺字段）
+        for w in list(getattr(self, "work_rows", [])):
+            w.frame.destroy()
+        self.work_rows = []
+        works_data = data.get("works")
+        if isinstance(works_data, list) and works_data:
+            for wd in works_data:
+                self.add_work(name=wd.get("name", "作品"), copies=wd.get("copies", 0))
+        else:
+            for i in range(int(self.param_vars["work_count"].get() or 4)):
+                self.add_work(name="作品%d" % (i + 1), copies=0)
+        self._refresh_work_status()
+        self._refresh_account_combo()
+        # 恢复快捷操作产生的大号收款批次
+        mb = data.get("manual_batches", [])
+        self.manual_batches = mb if isinstance(mb, list) else []
         # 恢复两个执行状态开关
         self.today_done_var.set(bool(data.get("today_done", False)))
         self.pack_today_var.set(bool(data.get("pack_today", False)))

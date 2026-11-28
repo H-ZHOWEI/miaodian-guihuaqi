@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-秒点规划器 v1.15.0
+秒点规划器 v1.16.0
 根据每个账号当前秒点余额，模拟并生成「点赞 / 登录领奖 / 复制转账 / 打包」的执行方案。
 用 Python 3.12 + tkinter，可打包为单文件 exe。
 """
@@ -25,7 +25,7 @@ import datetime
 import calendar
 
 APP_NAME = "秒点规划器"
-VERSION = "1.15.0"
+VERSION = "1.16.0"
 APP_VERSION = VERSION   # 版本更新模块使用
 
 # ===== 内置「版本更新」配置 =====
@@ -900,6 +900,78 @@ def _fill_login_curve(curve, note, start_claimed, p, start_day, rest_days):
         curve.setdefault(d, {})[note] = claimed
 
 
+def _eval_price(accounts, p, ctx, price):
+    """在给定统一定价下，用现有 simulate_small 评估各小号：返回过期浪费/复制次数/大号实收。"""
+    cal = {"year": ctx["year"], "month": ctx["month"], "days": ctx["days_in_month"]}
+    rest_days = ctx.get("rest_days", set())
+    start_day = ctx["start_day"]
+    pp = dict(p)
+    pp["work_price"] = price
+    waste = 0.0
+    copies = 0
+    income = 0.0
+    for ac in accounts:
+        if ac["role"] != "small":
+            continue
+        cp, ev, ai, _eb, _lu, _q = simulate_small(ac, pp, start_day, rest_days, cal=cal)
+        copies += len(cp)
+        income += ai
+        for _d, act, amt, _bal in ev:
+            if act == "秒点过期" and amt < 0:
+                waste += -amt
+    return {"waste": round(waste, 2), "copies": int(copies), "income": round(income, 2)}
+
+
+def recommend_price(accounts, p, ctx=None):
+    """为大号作品推荐一个统一上架秒点（方案期内固定，不中途改价）。
+
+    综合每个小号当前秒点与即将失效批次：枚举候选定价，复用同一套 simulate_small 模拟，
+    按「过期浪费最少 → 复制次数最少（不浪费前提下定价尽量高、操作尽量省）」选价。
+    观察窗口覆盖有效期（至少 2 倍有效期），让「攒不够而过期」能被识别。
+
+    返回 dict：price/waste/copies/income/current/candidates/note/ok；无小号时返回 None。
+    """
+    ctx = ctx or month_context()
+    smalls = [a for a in accounts if a["role"] == "small"]
+    if not smalls:
+        return None
+    expiry = max(1, int(p["expiry_days"]))
+    observe = max(int(p["plan_days"]), expiry * 2, expiry + 1)
+    pp = dict(p)
+    pp["plan_days"] = observe
+
+    # 候选价上限：覆盖当前余额、有效期内可得秒点、当前定价的 2 倍
+    gain_cap = (p["like_gain"] * p["like_per_day"] + p["login_bonus"]) * expiry
+    top = max([float(a["balance"]) for a in smalls] +
+              [gain_cap, float(p["work_price"]) * 2, 200.0])
+    top = int((top + 9) // 10 * 10)
+    candidates = list(range(10, top + 1, 10))
+
+    results = []
+    for cand in candidates:
+        r = _eval_price(accounts, pp, ctx, cand)
+        r["price"] = cand
+        results.append(r)
+
+    best = min(results, key=lambda r: (r["waste"], r["copies"]))
+    current_price = int(p["work_price"])
+    current = _eval_price(accounts, pp, ctx, current_price)
+    current["price"] = current_price
+
+    if best["waste"] <= 0.005:
+        note = ("按 %d 点上架：方案期内各号秒点可在到期前复制消耗完，无过期浪费；"
+                "这是不浪费前提下复制次数最少的一档，方案期内保持不变。" % best["price"])
+    else:
+        note = ("所有候选定价都会有部分秒点过期；%d 点过期最少（约 %g 点），"
+                "大号实收约 %g 点。方案期内保持不变。" %
+                (best["price"], best["waste"], best["income"]))
+    return {
+        "ok": True, "price": best["price"], "waste": best["waste"],
+        "copies": best["copies"], "income": best["income"],
+        "current": current, "candidates": results, "note": note,
+    }
+
+
 # ---------- GUI ----------
 # ---------- 视觉规范（仅外观，不影响任何计算）----------
 C_BG = "#F4F6FA"          # 页面底色
@@ -1223,6 +1295,8 @@ class App(tk.Tk):
                    command=self.on_view_current).pack(side="left", padx=8)
         ttk.Button(op, text="查看加减明细",
                    command=self.on_view_changes).pack(side="left")
+        ttk.Button(op, text="作品上架推荐",
+                   command=self.on_price_recommend).pack(side="left", padx=8)
         ttk.Button(op, text="导出明细CSV",
                    command=self.on_export).pack(side="left", padx=8)
         ttk.Label(op, textvariable=self.save_status_var,
@@ -2183,6 +2257,139 @@ class App(tk.Tk):
         txt.insert("1.0", self._build_change_detail_text())
         txt.configure(state="disabled")
         txt.yview_moveto(0)
+
+    # ---- 作品上架推荐：综合各号秒点与即将失效批次，给出一个统一的推荐上架秒点 ----
+    def _build_recommend_text(self, r):
+        """组装推荐说明全文：结论 → 各候选对比 → 计算依据与约束。"""
+        W = 72
+        L = []
+        L.append("=" * W)
+        L.append("大号作品上架秒点推荐（方案期内固定，不中途改价）")
+        L.append("生成时间：%s" % datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        L.append("=" * W)
+        L.append("")
+        L.append("【推荐结论】")
+        L.append("  每个作品统一上架：%d 点" % r["price"])
+        L.append("  %s" % r["note"])
+        cur = r["current"]
+        if cur["price"] != r["price"]:
+            L.append("  当前定价 %d 点：过期浪费约 %g 点、复制 %d 次、大号实收约 %g 点。" %
+                     (cur["price"], cur["waste"], cur["copies"], cur["income"]))
+            L.append("  推荐定价 %d 点：过期浪费约 %g 点、复制 %d 次、大号实收约 %g 点。" %
+                     (r["price"], r["waste"], r["copies"], r["income"]))
+        L.append("")
+        L.append("【候选定价对比】（过期浪费越少越好；同样不浪费时复制次数越少越省事）")
+        L.append("  %s  %s  %s  %s" % (
+            _pad("上架秒点", 10, "right"), _pad("过期浪费", 10, "right"),
+            _pad("复制次数", 10, "right"), _pad("大号实收", 12, "right")))
+        for c in r["candidates"]:
+            mark = "  ← 推荐" if c["price"] == r["price"] else ""
+            L.append("  %s  %s  %s  %s%s" % (
+                _pad("%d" % c["price"], 10, "right"),
+                _pad("%g" % c["waste"], 10, "right"),
+                _pad("%d" % c["copies"], 10, "right"),
+                _pad("%g" % c["income"], 12, "right"), mark))
+        L.append("")
+        L.append("【计算依据与约束】")
+        L.append("  · 综合每个小号「当前秒点 + 方案期内每日点赞/登录新增」与秒点有效期，")
+        L.append("    按先进先出模拟哪些批次会在到期前来不及被复制而流失。")
+        L.append("  · 目标：先把过期浪费降到最低，再在不浪费的前提下选复制次数最少（定价尽量高）的一档。")
+        L.append("  · 一个方案内每个作品的上架秒点保持不变，不按日调价；改价需到平台手动操作并会消耗秒点。")
+        L.append("  · 本推荐只给建议值，不会自动改平台定价；点「应用此价到作品定价」后需重新生成方案才会按新价排期。")
+        return "\n".join(L)
+
+    def on_price_recommend(self):
+        """计算并展示作品上架秒点推荐。"""
+        try:
+            accounts, p = self.collect()
+            r = recommend_price(accounts, p, self.ctx)
+            if not r or not r.get("ok"):
+                messagebox.showinfo("无法推荐",
+                                    "请保留至少一个小号，再计算作品上架推荐。", parent=self)
+                return
+            self._recommend_result = r
+            text = self._build_recommend_text(r)
+            win = getattr(self, "recommend_win", None)
+            if win is not None and win.winfo_exists():
+                w = getattr(self, "recommend_text", None)
+                if w is not None:
+                    w.configure(state="normal")
+                    w.delete("1.0", "end")
+                    w.insert("1.0", text)
+                    w.configure(state="disabled")
+                win.lift()
+                win.focus_set()
+                return
+
+            win = tk.Toplevel(self)
+            self.recommend_win = win
+            win.title("作品上架推荐 - %s" % APP_NAME)
+            win.configure(bg=C_BG)
+            win.geometry("960x760")
+            win.minsize(760, 560)
+
+            bar = tk.Frame(win, bg=C_SURFACE, highlightthickness=1,
+                           highlightbackground=C_BORDER)
+            bar.pack(fill="x")
+            brow = tk.Frame(bar, bg=C_SURFACE)
+            brow.pack(fill="x", padx=16, pady=10)
+            tk.Label(brow, text="作品上架推荐", bg=C_SURFACE, fg=C_INK,
+                     font=(FONT, 12, "bold")).pack(side="left", padx=(0, 14))
+            ttk.Label(brow, text="方案期内固定不调价", style="Muted.TLabel").pack(side="left")
+            ttk.Button(brow, text="关闭", command=self._close_recommend).pack(side="right", padx=3)
+            ttk.Button(brow, text="复制全文", command=self._copy_recommend).pack(side="right", padx=3)
+            ttk.Button(brow, text="应用此价到作品定价", style="Primary.TButton",
+                       command=self._apply_recommend_price).pack(side="right", padx=3)
+
+            body = tk.Frame(win, bg=C_BG)
+            body.pack(fill="both", expand=True, padx=12, pady=12)
+            txt = scrolledtext.ScrolledText(body, wrap="none", font=("Consolas", 10),
+                                            bg=C_SURFACE, fg=C_INK,
+                                            insertbackground=C_PRIMARY,
+                                            padx=16, pady=14, highlightthickness=1,
+                                            highlightbackground=C_BORDER, relief="flat")
+            txt.pack(fill="both", expand=True)
+            txt.insert("1.0", text)
+            txt.configure(state="disabled")
+            self.recommend_text = txt
+            win.protocol("WM_DELETE_WINDOW", self._close_recommend)
+            win.after(80, lambda: (win.lift(), win.focus_set()))
+        except Exception as e:
+            messagebox.showerror("推荐失败", str(e), parent=self)
+
+    def _apply_recommend_price(self):
+        """把推荐价写回「作品定价」参数框并保存。"""
+        r = getattr(self, "_recommend_result", None)
+        if not r:
+            return
+        try:
+            self.param_vars["work_price"].set(str(r["price"]))
+            self._auto_save()
+            messagebox.showinfo(
+                "已应用", "作品定价已设为 %d 点并保存。\n"
+                "请点「一键生成并采用」或「生成方案」重新排期，方案才会按新价执行。" % r["price"],
+                parent=getattr(self, "recommend_win", self))
+        except Exception as e:
+            messagebox.showerror("应用失败", str(e), parent=self)
+
+    def _copy_recommend(self):
+        w = getattr(self, "recommend_text", None)
+        if w is None:
+            return
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(w.get("1.0", "end-1c"))
+            messagebox.showinfo("已复制", "推荐说明已复制到剪贴板。",
+                                parent=getattr(self, "recommend_win", self))
+        except Exception:
+            pass
+
+    def _close_recommend(self):
+        win = getattr(self, "recommend_win", None)
+        if win is not None and win.winfo_exists():
+            win.destroy()
+        self.recommend_win = None
+        self.recommend_text = None
 
     def on_view_changes(self):
         """独立窗口展示每笔扣除/增加明细，供用户核对是否有加减错误。"""

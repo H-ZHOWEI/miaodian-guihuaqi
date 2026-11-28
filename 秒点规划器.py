@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-秒点规划器 v1.18.0
+秒点规划器 v1.19.0
 根据每个账号当前秒点余额，模拟并生成「点赞 / 登录领奖 / 复制转账 / 打包」的执行方案。
 用 Python 3.12 + tkinter，可打包为单文件 exe。
 """
@@ -25,7 +25,7 @@ import datetime
 import calendar
 
 APP_NAME = "秒点规划器"
-VERSION = "1.18.0"
+VERSION = "1.19.0"
 APP_VERSION = VERSION   # 版本更新模块使用
 
 # ===== 内置「版本更新」配置 =====
@@ -1500,12 +1500,18 @@ class App(tk.Tk):
                                         state="readonly", width=14)
         self.quick_combo.pack(side="left", padx=(4, 14))
         self.quick_combo.bind("<<ComboboxSelected>>", lambda e: self._refresh_work_combo())
-        ttk.Button(qrow, text="发布应用（-20，仅大号）",
-                   command=self.on_publish_app).pack(side="left")
-        ttk.Button(qrow, text="已点赞20次（+点）",
-                   command=self.on_quick_like).pack(side="left", padx=8)
-        ttk.Button(qrow, text="已复制大号作品",
-                   command=self.on_quick_copy).pack(side="left")
+        self.publish_btn = ttk.Button(qrow, text="发布应用（-20，仅大号）",
+                                      command=self.on_publish_app)
+        self.publish_btn.pack(side="left")
+        self.like_btn = ttk.Button(qrow, text="已点赞20次（+点）",
+                                   command=self.on_quick_like)
+        self.like_btn.pack(side="left", padx=8)
+        self.copy_btn = ttk.Button(qrow, text="已复制大号作品",
+                                   command=self.on_quick_copy)
+        self.copy_btn.pack(side="left")
+        self.undo_btn = ttk.Button(qrow, text="↩ 撤回今天的记录",
+                                   command=self.on_undo_quick)
+        self.undo_btn.pack(side="left", padx=8)
         qhint = tk.Frame(qbox, bg=C_SURFACE)
         qhint.pack(fill="x", padx=16, pady=(0, 8))
         self.quick_hint_var = tk.StringVar(value="")
@@ -1680,6 +1686,8 @@ class App(tk.Tk):
         # 快捷操作产生的大号收款批次：按到期日展示（如3个小号同日复制→240点7天后到期）
         mb_due = {}
         for b in getattr(self, "manual_batches", []):
+            if b.get("revoked"):
+                continue
             try:
                 exp = datetime.date.fromisoformat(b["expire"])
                 left = (exp - today).days
@@ -2110,13 +2118,36 @@ class App(tk.Tk):
                                     rolled_back=target < last)
         return changed
 
-    def _append_change_log(self, entries):
-        """把本次实际加减追加到记录（保留最近 500 条，避免无限增长）。"""
+    def _ensure_log_seq(self):
+        """给每一笔记录分配稳定编号（含旧配置），撤回按编号关联，不删原记录。"""
         log = getattr(self, "change_log", None)
         if not isinstance(log, list):
             log = []
-        log.extend(entries)
-        self.change_log = log[-500:]
+        top = 0
+        for e in log:
+            try:
+                top = max(top, int(e.get("seq", 0) or 0))
+            except Exception:
+                pass
+        for e in log:
+            if not e.get("seq"):
+                top += 1
+                e["seq"] = top
+        self.change_log = log
+
+    def _append_change_log(self, entries):
+        """追加实际加减记录；用户操作永久保留，撤回也另记一笔而不覆盖原记录。"""
+        log = getattr(self, "change_log", None)
+        if not isinstance(log, list):
+            log = []
+        self.change_log = log
+        self._ensure_log_seq()
+        top = max([int(e.get("seq", 0) or 0) for e in self.change_log] or [0])
+        for e in entries:
+            d = dict(e)
+            top += 1
+            d["seq"] = top
+            self.change_log.append(d)
 
     def _negative_notes(self):
         """返回当前余额为负的账号备注列表。"""
@@ -2290,26 +2321,43 @@ class App(tk.Tk):
     def _refresh_quick_hint(self, msg=None):
         if not hasattr(self, "quick_hint_var"):
             return
+        note = self.quick_note_var.get()
+        r = self._find_row_by_note(note) if note else None
+        is_big = bool(r and r.role == "big")
+        liked = bool(note and self._has_today_op(note, "like"))
+        copied = bool(note and self._has_today_op(note, "copy"))
+        can_undo = bool(note and self._active_manual_entries(note=note))
+        # 发布仅大号；点赞/复制每个账号一天各一次；大号不能复制；有记录才允许撤回
+        for btn, enabled in ((getattr(self, "publish_btn", None), is_big),
+                             (getattr(self, "like_btn", None), bool(note) and not liked),
+                             (getattr(self, "copy_btn", None), bool(note) and not is_big and not copied),
+                             (getattr(self, "undo_btn", None), can_undo)):
+            if btn is not None:
+                btn.configure(state="normal" if enabled else "disabled")
         if msg:
             self.quick_hint_var.set(msg)
             return
-        note = self.quick_note_var.get()
-        r = self._find_row_by_note(note) if note else None
         if not note or not r:
             self.quick_hint_var.set("先在上方下拉选择账号；实际在平台做了操作，就点对应按钮记一笔，"
                                     "秒点增减与7天到期自动记录。")
         elif r.role == "big":
-            self.quick_hint_var.set("当前：%s（大号）。可点「发布应用」扣 %d 点上新作品，也可记点赞；"
-                                    "大号收到的小号复制款会记在【大号收款批次】并按7天到期。"
-                                    % (note, int(DEFAULTS["publish_cost"])))
+            head = "当前：%s（大号）。可点「发布应用」扣 %d 点上新作品，也可记点赞；" \
+                   "「已复制大号作品」仅小号操作，大号不能点；" % (note, int(DEFAULTS["publish_cost"]))
+            if liked:
+                head += "今天已记过点赞（如需更正请点撤回）；"
+            head += "大号收到的小号复制款会记在【大号收款批次】并按7天到期。"
+            self.quick_hint_var.set(head)
         else:
-            self.quick_hint_var.set("当前：%s（小号）。点赞按每次 %d 点记 %d 次；复制按每个作品 %d 点扣，"
-                                    "大号实收 %g 点并按7天到期。"
-                                    % (note, int(DEFAULTS["like_gain"]),
-                                       int(DEFAULTS["like_per_day"]),
-                                       int(self.param_vars["work_price"].get() or 0),
-                                       int(self.param_vars["work_price"].get() or 0)
-                                       * (1 - float(self.param_vars["copy_fee_pct"].get() or 0) / 100.0)))
+            head = "当前：%s（小号）。点赞按每次 %d 点记 %d 次；复制按每个作品 %d 点扣，" \
+                   "大号实收 %g 点并按7天到期。" % (
+                       note, int(DEFAULTS["like_gain"]), int(DEFAULTS["like_per_day"]),
+                       int(self.param_vars["work_price"].get() or 0),
+                       int(self.param_vars["work_price"].get() or 0)
+                       * (1 - float(self.param_vars["copy_fee_pct"].get() or 0) / 100.0))
+            if liked or copied:
+                head += " 今天已记过%s（每个号一天只能记一次，如需更正请点撤回）。" % (
+                    "、".join(x for x, y in (("点赞", liked), ("复制", copied)) if y))
+            self.quick_hint_var.set(head)
 
     def _read_param(self, key, default):
         try:
@@ -2318,38 +2366,80 @@ class App(tk.Tk):
         except Exception:
             return default
 
-    def _today_manual_ops(self):
-        """从操作记录提取「今天已手动做过什么」，供生成方案首日跳过、避免重复安排。
-        返回 {账号备注: {"like": bool, "copy": int, "publish": bool}}。
-        记录永久保留在 change_log，本方法只读不改。"""
+    @staticmethod
+    def _op_kind(e):
+        """把一条快捷操作记录归类：like / publish / copy / income。"""
+        reason = str(e.get("reason", ""))
+        try:
+            delta = float(e.get("delta", 0))
+        except Exception:
+            delta = 0.0
+        if reason.startswith("已点赞"):
+            return "like"
+        if reason.startswith("发布应用"):
+            return "publish"
+        if reason.startswith("收款:"):
+            return "income"
+        if reason.startswith("复制") and delta < 0:
+            return "copy"
+        return ""
+
+    def _undone_op_ids(self):
+        """已被撤回的操作标记（操作组编号 / 旧记录的流水号）；原记录保留不动。"""
+        return {str(e.get("undo_of")) for e in (getattr(self, "change_log", []) or [])
+                if e.get("undo_of")}
+
+    def _active_manual_entries(self, kind=None, note=None, include_income=False):
+        """取今天仍然有效的快捷操作记录（已撤回的自动排除）。"""
         today = datetime.date.today().isoformat()
-        out = {}
+        undone = self._undone_op_ids()
+        out = []
         for e in getattr(self, "change_log", []) or []:
             try:
-                if e.get("source") != "manual":
+                if e.get("source") != "manual" or not str(e.get("ts", "")).startswith(today):
                     continue
-                ts = str(e.get("ts", ""))
-                if not ts.startswith(today):
+                if str(e.get("op_id") or "") in undone or ("seq%s" % e.get("seq")) in undone:
                     continue
-                note = e.get("note", "")
-                reason = str(e.get("reason", ""))
-                delta = float(e.get("delta", 0))
-                slot = out.setdefault(note, {"like": False, "copy": 0, "publish": False})
-                if reason.startswith("已点赞"):
-                    slot["like"] = True
-                elif reason.startswith("发布应用"):
-                    slot["publish"] = True
-                elif reason.startswith("复制") and delta < 0:
-                    slot["copy"] += 1
+                k = self._op_kind(e)
+                if not k or (k == "income" and not include_income):
+                    continue
+                if kind and k != kind:
+                    continue
+                if note and e.get("note") != note:
+                    continue
+                out.append(e)
             except Exception:
                 continue
         return out
 
-    def _log_manual(self, note, delta, reason, big_gain=0.0, work_name="", from_note=""):
-        """记一笔快捷操作：改账号余额 + change_log + （大号收款）手动批次。"""
+    def _has_today_op(self, note, kind):
+        return bool(self._active_manual_entries(kind=kind, note=note))
+
+    def _today_manual_ops(self):
+        """从操作记录提取「今天已手动做过什么」，供生成方案首日跳过、避免重复安排。
+        返回 {账号备注: {"like": bool, "copy": int, "publish": bool}}；撤回的不算。
+        记录永久保留在 change_log，本方法只读不改。"""
+        out = {}
+        for e in self._active_manual_entries():
+            note = e.get("note", "")
+            slot = out.setdefault(note, {"like": False, "copy": 0, "publish": False})
+            k = self._op_kind(e)
+            if k == "like":
+                slot["like"] = True
+            elif k == "publish":
+                slot["publish"] = True
+            elif k == "copy":
+                slot["copy"] += 1
+        return out
+
+    def _log_manual(self, note, delta, reason, big_gain=0.0, work_name="",
+                    from_note="", op_id=None, created_work=""):
+        """记一笔快捷操作：改账号余额 + change_log + （大号收款）手动批次。
+        返回操作组编号 op_id：同一笔复制的小号扣款与大号收款共用一个编号，撤回时一起回退。"""
         r = self._find_row_by_note(note)
         if r is None:
-            return False
+            return None
+        op_id = op_id or ("op%012x" % time.time_ns())
         try:
             cur = float(r.bal_var.get() or 0)
         except ValueError:
@@ -2366,7 +2456,12 @@ class App(tk.Tk):
             "day": today.day, "note": note, "delta": round(delta, 2),
             "before": round(cur, 2), "after": newv, "login_delta": 0,
             "reason": reason, "direction": "快捷操作", "source": "manual",
+            "op_id": op_id,
         }])
+        if created_work:
+            self.change_log[-1]["created_work"] = created_work
+        if work_name:
+            self.change_log[-1]["work_name"] = work_name
         if big_gain > 0:
             expire_days = int(self._read_param("expiry_days", DEFAULTS["expiry_days"]))
             self.manual_batches.append({
@@ -2374,8 +2469,9 @@ class App(tk.Tk):
                 "amount": round(big_gain, 2),
                 "name": work_name, "from": from_note or note,
                 "expire": (today + datetime.timedelta(days=expire_days)).isoformat(),
+                "op_id": op_id, "revoked": False,
             })
-        return True
+        return op_id
 
     def on_publish_app(self):
         """发布/上架新作品：仅大号可点，扣 publish_cost 点并新增一个空作品。"""
@@ -2398,18 +2494,22 @@ class App(tk.Tk):
                                        % (cur, cost), parent=self):
                 return
         name = "新作品%d" % (len(self.work_rows) + 1)
-        self._log_manual(note, -cost, "发布应用-%d" % cost)
+        self._log_manual(note, -cost, "发布应用-%d" % cost, created_work=name)
         self.add_work(name=name, copies=0)
         self._auto_save()
         self._refresh_quick_hint("已在平台发布「%s」并记录：%s -%d 点；新作品累计复制从 0 开始。"
                                  % (name, note, cost))
 
     def on_quick_like(self):
-        """已点赞20次：选中账号按 like_gain×like_per_day 加秒点，记7天到期。"""
+        """已点赞20次：选中账号按 like_gain×like_per_day 加秒点，记7天到期。每号每天一次。"""
         note = self.quick_note_var.get()
         r = self._find_row_by_note(note) if note else None
         if r is None:
             messagebox.showwarning("提示", "请先在下拉框选择账号。", parent=self)
+            return
+        if self._has_today_op(note, "like"):
+            self._refresh_quick_hint("⚠ %s 今天已记过点赞，一个号一天只能记一次；"
+                                     "如记错了请点「撤回今天的记录」后再重新记录。" % note)
             return
         per = self._read_param("like_gain", DEFAULTS["like_gain"])
         cnt = int(self._read_param("like_per_day", DEFAULTS["like_per_day"]))
@@ -2426,11 +2526,18 @@ class App(tk.Tk):
                                     expire_days))
 
     def on_quick_copy(self):
-        """已复制大号作品：小号扣定价，大号加实收并记7天到期；作品累计次数+1。"""
+        """已复制大号作品：仅小号可点，每号每天一次；小号扣定价，大号加实收并记7天到期。"""
         note = self.quick_note_var.get()
         r = self._find_row_by_note(note) if note else None
         if r is None:
             messagebox.showwarning("提示", "请先在下拉框选择账号。", parent=self)
+            return
+        if r.role == "big":
+            self._refresh_quick_hint("⚠「已复制大号作品」只有小号能操作；请切换到对应的小号再记录。")
+            return
+        if self._has_today_op(note, "copy"):
+            self._refresh_quick_hint("⚠ %s 今天已记过复制，一个号一天只能记一次；"
+                                     "如记错了请点「撤回今天的记录」后再重新记录。" % note)
             return
         works = self._collect_works()
         if not works:
@@ -2451,16 +2558,9 @@ class App(tk.Tk):
         price = self._read_param("work_price", DEFAULTS["work_price"])
         fee = self._read_param("copy_fee_pct", DEFAULTS["copy_fee_pct"])
         gain = round(price * (1 - fee / 100.0), 2)
-        is_big = (r.role == "big")
-        if is_big:
-            # 大号自己复制不产生自己的转账收入，只扣定价（异常情况如实记）
-            self._log_manual(note, -price, "复制%s-%g（大号自复制不计收款）" % (work["name"], price))
-            self._auto_save()
-            self._refresh_quick_hint("已记录：%s 复制「%s」-%g 点（大号自复制不产生自己的收款）。"
-                                     % (note, work["name"], price))
-            return
-        # 小号复制：小号扣定价；大号加实收并记收款批次
-        self._log_manual(note, -price, "复制%s-%g" % (work["name"], price))
+        # 小号复制：小号扣定价；大号加实收并记收款批次（同一 op_id 便于整笔撤回）
+        op_id = self._log_manual(note, -price, "复制%s-%g" % (work["name"], price),
+                                 work_name=work["name"])
         big_note = None
         for rr in self.rows:
             if rr.role == "big":
@@ -2468,7 +2568,8 @@ class App(tk.Tk):
                 break
         if big_note:
             self._log_manual(big_note, gain, "收款:%s(来自%s)" % (work["name"], note),
-                             big_gain=gain, work_name=work["name"], from_note=note)
+                             big_gain=gain, work_name=work["name"], from_note=note,
+                             op_id=op_id)
         # 作品累计次数+1
         for w in self.work_rows:
             if (w.name_var.get().strip() or "作品") == work["name"]:
@@ -2490,6 +2591,183 @@ class App(tk.Tk):
                                  % (note, work["name"], price, gain,
                                     (datetime.date.today() + datetime.timedelta(days=expire_days)).isoformat(),
                                     expire_days, work["copies"] + 1))
+
+    def on_undo_quick(self):
+        """撤回当前账号今天记错的一笔快捷操作（点赞 / 复制 / 发布应用）。"""
+        note = self.quick_note_var.get()
+        if not note:
+            messagebox.showwarning("提示", "请先在下拉框选择账号。", parent=self)
+            return
+        entries = self._active_manual_entries(note=note)
+        groups = {}
+        for e in entries:
+            k = self._op_kind(e)
+            if k == "income":  # 大号收款跟随复制那笔一起撤回，不单独列出
+                continue
+            key = str(e.get("op_id") or ("seq%s" % e.get("seq")))
+            groups.setdefault(key, []).append(e)
+        if not groups:
+            self._refresh_quick_hint("当前账号今天没有可撤回的记录；只有点过快捷操作后才能撤回。")
+            return
+        picked = self._ask_undo_group(groups, note)
+        if not picked:
+            return
+        title = str(picked[0].get("reason", ""))[:28]
+        if not messagebox.askyesno(
+                "确认撤回",
+                "确定撤回「%s」这笔记录吗？\n\n"
+                "对应账号的秒点会反向调整；复制会退回大号收款与作品累计次数；"
+                "发布应用会删除尚未使用的新作品。原操作记录不会删除，明细里会保留两笔供核对。"
+                % title, parent=self):
+            return
+        self._apply_undo_group(picked)
+
+    def _ask_undo_group(self, groups, note):
+        """列出当前账号今天可撤回的操作，返回用户选中的那一组记录。"""
+        win = tk.Toplevel(self)
+        win.title("撤回今天的快捷操作")
+        win.transient(self)
+        win.grab_set()
+        win.resizable(False, False)
+        tk.Label(win, text="%s 今天已记录的操作（选一笔撤回）" % note,
+                 font=(FONT, 11, "bold"), bg=C_SURFACE, fg=C_INK).pack(padx=18, pady=(14, 6))
+        tk.Label(win, text="撤回后原记录保留，另记一笔反向流水；已过期的秒点不会回来。",
+                 font=(FONT, 9), bg=C_SURFACE, fg=C_MUTED).pack(padx=18, pady=(0, 8))
+        lb = tk.Listbox(win, width=58, height=min(8, max(3, len(groups) + 1)),
+                        font=(FONT, 10), bg="#FFFFFF", fg=C_INK,
+                        highlightbackground=C_BORDER)
+        labels = []
+        for key, es in groups.items():
+            head = es[0]
+            ts = str(head.get("ts", ""))[11:16] or "—"
+            kind = self._op_kind(head)
+            kind_cn = {"like": "点赞", "copy": "复制", "publish": "发布"}.get(kind, kind)
+            total = 0.0
+            for e in es:
+                try:
+                    total += float(e.get("delta", 0))
+                except Exception:
+                    pass
+            labels.append("%s  %-4s  %s  %+g 点" % (
+                ts, kind_cn, str(head.get("reason", ""))[:26], total))
+            lb.insert("end", labels[-1])
+        lb.pack(padx=18, pady=4)
+        if labels:
+            lb.selection_set(0)
+        bfr = tk.Frame(win)
+        bfr.pack(pady=(8, 14))
+        result = {"picked": None}
+
+        def _ok():
+            sel = lb.curselection()
+            if not sel:
+                return
+            result["picked"] = groups[list(groups.keys())[int(sel[0])]]
+            win.destroy()
+
+        ttk.Button(bfr, text="撤回选中这笔", style="Primary.TButton", command=_ok).pack(side="left", padx=6)
+        ttk.Button(bfr, text="取消", command=win.destroy).pack(side="left")
+        _center_window(win, parent=self)
+        self.wait_window(win)
+        return result["picked"]
+
+    @staticmethod
+    def _undo_work_name(e):
+        name = str(e.get("work_name") or "")
+        if name:
+            return name
+        reason = str(e.get("reason", ""))
+        if reason.startswith("复制"):
+            return reason[2:].rsplit("-", 1)[0].replace("（大号自复制不计收款）", "")
+        return ""
+
+    def _apply_undo_group(self, picked):
+        """按组反向改余额 / 批次 / 作品次数，逐笔追加撤回流水（不覆盖原记录）。"""
+        op_ids = {str(e.get("op_id") or "") for e in picked if e.get("op_id")}
+        related = []
+        for e in list(getattr(self, "change_log", []) or []):
+            if e in picked:
+                related.append(e)
+            elif str(e.get("op_id") or "") in op_ids and e.get("source") == "manual":
+                related.append(e)  # 大号收款跟随复制那笔一起回退
+        mark = str(picked[0].get("op_id") or ("seq%s" % picked[0].get("seq")))
+        today = datetime.date.today()
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        totals = {}
+        for e in related:
+            try:
+                totals[e.get("note", "")] = totals.get(e.get("note", ""), 0.0) + float(e.get("delta", 0))
+            except Exception:
+                pass
+        news = {}
+        self._binding_saves = True
+        try:
+            for n, total in totals.items():
+                r = self._find_row_by_note(n)
+                if r is None:
+                    continue
+                try:
+                    cur = float(r.bal_var.get() or 0)
+                except ValueError:
+                    cur = 0.0
+                newv = round(cur - total, 2)
+                r.bal_var.set("%g" % newv)
+                news[n] = (cur, newv)
+        finally:
+            self._binding_saves = False
+        undo_entries = []
+        for e in related:
+            n = e.get("note", "")
+            before, after = news.get(n, (0.0, 0.0))
+            try:
+                delta = -float(e.get("delta", 0))
+            except Exception:
+                delta = 0.0
+            undo_entries.append({
+                "ts": now, "day": today.day, "note": n, "delta": round(delta, 2),
+                "before": round(before, 2), "after": after, "login_delta": 0,
+                "reason": "撤回：%s" % e.get("reason", ""), "direction": "撤回",
+                "source": "undo", "undo_of": mark,
+                "work_name": e.get("work_name", ""),
+            })
+        self._append_change_log(undo_entries)
+        # 大号收款批次作废（明细里仍可见，标注已撤回）
+        for b in getattr(self, "manual_batches", []):
+            if str(b.get("op_id") or "") in op_ids:
+                b["revoked"] = True
+        # 作品累计次数 / 发布的新作品回退
+        tips = []
+        for w in list(getattr(self, "work_rows", [])):
+            wname = w.name_var.get().strip()
+            if not wname:
+                continue
+            if any(str(e.get("created_work") or "") == wname for e in picked):
+                try:
+                    cp = int(w.copies_var.get() or 0)
+                except ValueError:
+                    cp = 0
+                if cp == 0:
+                    w.frame.destroy()
+                    self.work_rows.remove(w)
+                    tips.append("已删除新作品「%s」" % wname)
+                else:
+                    tips.append("「%s」已产生复制记录，保留作品、仅回退秒点" % wname)
+                continue
+            minus = sum(1 for e in picked
+                        if self._op_kind(e) == "copy" and self._undo_work_name(e) == wname)
+            if minus:
+                try:
+                    cp = int(w.copies_var.get() or 0)
+                except ValueError:
+                    cp = 0
+                w.copies_var.set(str(max(0, cp - minus)))
+                tips.append("「%s」累计次数 -%d" % (wname, minus))
+        self._refresh_work_status()
+        self._refresh_account_combo()
+        self._auto_save()
+        extra = ("；" + "，".join(tips)) if tips else ""
+        self._refresh_quick_hint("已撤回：%s（原记录保留，明细中可核对反向流水）%s。"
+                                 % (str(picked[0].get("reason", ""))[:30], extra))
 
     def _ask_copy_work(self, avail, limit):
         """简易对话框：选择一个作品（含当前累计次数），返回该作品 dict。"""
@@ -2609,7 +2887,9 @@ class App(tk.Tk):
         accounts, p = self.collect()
         works = self._collect_works()
         today_ops = self._today_manual_ops()       # 今日已手动操作（记录只读，永久保留）
-        manual_batches = getattr(self, "manual_batches", [])  # 大号手动收款批次
+        # 大号手动收款批次：已撤回的不再参与方案到期提醒
+        manual_batches = [b for b in (getattr(self, "manual_batches", []) or [])
+                          if not b.get("revoked")]
         text, rows, _sections, actions, balance_curve, login_curve, expiry, work_copy_curve = build_plan(
             accounts, p, self.ctx, pack_on_start=self.pack_today_var.get(), works=works,
             today_ops=today_ops, manual_batches=manual_batches)
@@ -2907,7 +3187,8 @@ class App(tk.Tk):
 
         # ---- 四、实际加减记录（推进/回退时真实改了多少） ----
         lines.append("")
-        lines.append("【四】软件实际加减记录（每日推进 / 取消勾选回退时真实改到余额上的数）")
+        lines.append("【四】软件实际加减记录（每日推进 / 快捷操作 / 撤回时真实改到余额上的数）")
+        lines.append("  说明：撤回不删除原记录，而是另记一笔「撤回」反向流水；两笔净额为 0，便于逐笔核对。")
         lines.append("-" * W)
         log = getattr(self, "change_log", None)
         if not isinstance(log, list) or not log:
@@ -2941,7 +3222,9 @@ class App(tk.Tk):
                 try:
                     exp = datetime.date.fromisoformat(b["expire"])
                     left = (exp - today).days
-                    if left < 0:
+                    if b.get("revoked"):
+                        status = "已撤回（不计入）"
+                    elif left < 0:
                         status = "已到期"
                     elif left == 0:
                         status = "⚠今天到期"
@@ -3369,12 +3652,15 @@ class App(tk.Tk):
         # 恢复快捷操作产生的大号收款批次
         mb = data.get("manual_batches", [])
         self.manual_batches = mb if isinstance(mb, list) else []
+        for b in self.manual_batches:
+            b.setdefault("revoked", False)
         # 恢复两个执行状态开关
         self.today_done_var.set(bool(data.get("today_done", False)))
         self.pack_today_var.set(bool(data.get("pack_today", False)))
         # 恢复实际加减记录（供「查看加减明细」核对，兼容旧配置缺字段）
         log = data.get("change_log", [])
         self.change_log = log if isinstance(log, list) else []
+        self._ensure_log_seq()   # 旧记录也编号，撤回时可精确定位
         self._refresh_date_bar()
 
     def _auto_load(self):

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-秒点规划器 v1.17.0
+秒点规划器 v1.18.0
 根据每个账号当前秒点余额，模拟并生成「点赞 / 登录领奖 / 复制转账 / 打包」的执行方案。
 用 Python 3.12 + tkinter，可打包为单文件 exe。
 """
@@ -25,7 +25,7 @@ import datetime
 import calendar
 
 APP_NAME = "秒点规划器"
-VERSION = "1.17.0"
+VERSION = "1.18.0"
 APP_VERSION = VERSION   # 版本更新模块使用
 
 # ===== 内置「版本更新」配置 =====
@@ -443,22 +443,41 @@ def _day_text(year, month, day, days_in_month=None):
     return "%d月%d日" % (m2, day - days_in_month)
 
 
+def _real_date(year, month, day):
+    """把「当月第 day 天」换成真实日期：day=1 为当月1号，day<=0 往前跨月、
+    超过月末往后跨月，跨年自动进位。供过期批次（获得日可为负）统一换算。"""
+    return datetime.date(year, month, 1) + datetime.timedelta(days=int(day) - 1)
+
+
 def _date_stamp(year, month, day, days_in_month=None):
-    """平台口径的日期戳 YYYY-MM-DD；超过当月天数按真实日历跨月、跨年进位。"""
-    if days_in_month is None:
-        days_in_month = calendar.monthrange(year, month)[1]
-    if day <= days_in_month:
-        y, m, d = year, month, day
-    else:
-        base = datetime.date(year, month, days_in_month)
-        t = base + datetime.timedelta(days=day - days_in_month)
-        y, m, d = t.year, t.month, t.day
-    return "%04d-%02d-%02d" % (y, m, d)
+    """平台口径的日期戳 YYYY-MM-DD；day<=0 往前跨月、超月末往后跨月、跨年自动进位。"""
+    t = _real_date(year, month, day)
+    return "%04d-%02d-%02d" % (t.year, t.month, t.day)
 
 
 def _expire_stamp(year, month, day, days_in_month=None):
     """平台口径的到期时间戳：到期日当天 00:00 失效（截图：发生 11-27 → 到期 12-04 00:00）。"""
     return _date_stamp(year, month, day, days_in_month) + " 00:00"
+
+
+def _initial_queue(ac, p, start_day):
+    """构造账号初始秒点队列。
+
+    普通情况：当前余额整批视为「起始日获得」，有效期后过期。
+    勾选「今天有今晚12点过期的秒点」（ac['expire_today']=True）：
+      把当前余额均分成 expiry 份，获得日依次为 start_day-expiry ... start_day-1，
+      于是从今晚(start_day)起每天过期一份——对应平台「每天过期7天前获得的那批」。
+    负余额不走队列（记为欠费 debt），保持原逻辑。
+    """
+    bal = float(ac.get("balance", 0))
+    if bal <= 0:
+        return []
+    expiry = max(1, int(p.get("expiry_days", 7)))
+    if ac.get("expire_today"):
+        per = bal / float(expiry)
+        # 获得日 = start_day-expiry ... start_day-1（今晚 start_day 过期的正是最早那份）
+        return [(start_day - expiry + i, round(per, 6)) for i in range(expiry)]
+    return [(start_day, bal)]
 
 
 def _init_work_state(p, works=None):
@@ -481,20 +500,23 @@ def _init_work_state(p, works=None):
             for i in range(max(1, int(p["work_count"])))]
 
 
-def simulate_small(ac, p, start_day=1, rest_days=None, cal=None, work_state=None):
+def simulate_small(ac, p, start_day=1, rest_days=None, cal=None, work_state=None, today_ops=None):
     """模拟一个小号。返回 (copies, daily_events, author_income, end_balance, login_used, queue)
     start_day: 方案起始的真实日历日（今天几号），所有 day 均为日历日。
     rest_days: 周日集合，这些天零收入（不点赞、不登录、不复制），但秒点照常过期。
     cal: {"year","month","days"} 日历信息，供过期标注跨月显示真实日期；缺省按「N日」标注。
     work_state: 大号作品状态（跨小号共享、原地累计复制次数）；缺省按作品数生成。
+    today_ops: 今日已手动做过的操作 {"like": bool, "copy": int}；首日跳过相应安排，
+               避免与用户已经点过的快捷操作重复加/扣秒点（余额本身已含手动变动）。
     """
     rest_days = rest_days or set()
+    today_ops = today_ops or {}
     like_gain = p["like_gain"] * p["like_per_day"]
     login_left = max(0, p["login_days_cap"] - int(ac.get("login_claimed", 0)))
     login_granted = 0  # 方案窗口内实际领到的登录奖励次数
     # 负余额=欠费：如实记为债务，后续收益须先偿还，不能用「从0开始」抹掉
     debt = max(0.0, -float(ac.get("balance", 0)))
-    queue = [(start_day, float(ac["balance"]))] if ac["balance"] > 0 else []
+    queue = _initial_queue(ac, p, start_day)  # 勾选今晚过期则余额均分7份、每天过期一份
     copies = []       # (day, work_index_1based)
     events = []       # 每日事件 list of (day, action, amount, balance)
     ptr = 0
@@ -517,7 +539,9 @@ def simulate_small(ac, p, start_day=1, rest_days=None, cal=None, work_state=None
             # 周日：不点赞、不领登录奖、不复制；只记录零收入
             events.append((d, "周日休息(无收入)", 0, _bal()))
         else:
-            gain = like_gain
+            is_first = (d == start_day)
+            # 今日已手动点赞 → 首日不再重复安排点赞收益（登录奖仍按规则发）
+            gain = 0 if (is_first and today_ops.get("like")) else like_gain
             login_flag = login_left > 0
             if login_flag:
                 gain += p["login_bonus"]
@@ -534,7 +558,10 @@ def simulate_small(ac, p, start_day=1, rest_days=None, cal=None, work_state=None
             # 每笔都记录「这笔操作之后」的真实余额，不再全部填成日终值。
             # 还债是收入的内部去向：合并进文案说明，不单列一笔金额对不上的账。
             now = _bal()
-            label = "登录领奖+点赞" if login_flag else "点赞"
+            if is_first and today_ops.get("like") and not login_flag:
+                label = "今天已点赞(跳过)"
+            else:
+                label = "登录领奖+点赞" if login_flag else "点赞"
             if p["expiry_days"] > 0:
                 if cal:
                     label += "(本批%s到期)" % _expire_stamp(
@@ -546,6 +573,8 @@ def simulate_small(ac, p, start_day=1, rest_days=None, cal=None, work_state=None
             events.append((d, label, round(gain + pay, 2), now))
 
             made = 0
+            # 说明：手动复制时余额已实时扣减，方案从扣后余额出发，不会重复扣点；
+            # 今日已复制次数只在方案文本里「体现」，不在这里再减一次（否则重复计算）。
             while price > 0 and _total(queue) >= price:
                 # 只复制「在售且未达40次」的作品；满40次的下线，避免大号白干
                 avail = [i for i, w in enumerate(work_state)
@@ -571,20 +600,23 @@ def simulate_small(ac, p, start_day=1, rest_days=None, cal=None, work_state=None
     return copies, events, author_income, _total(queue) - debt, login_granted, queue
 
 
-def simulate_big(ac, p, income_by_day, start_day=1, rest_days=None, pack_on_start=False, cal=None):
+def simulate_big(ac, p, income_by_day, start_day=1, rest_days=None, pack_on_start=False,
+                 cal=None, today_ops=None):
     """模拟大号。income_by_day: dict day(日历日)->小号转账金额。
     rest_days: 周日集合，这些天零收入，但后端照常扣费。
     pack_on_start: 用户勾选「起始日打包」→ 仅在起始日打包一次并扣点；平时不自动打包。
+    today_ops: 今日已手动操作 {"like": bool}；首日跳过已做过的点赞，避免重复安排。
     返回 (packs, events, end_balance, login_used, packable_days)
       packs: 实际打包的日期列表；packable_days: 余额达到打包线、可随时手动打包的日期列表。
     """
     rest_days = rest_days or set()
+    today_ops = today_ops or {}
     like_gain = p["like_gain"] * p["like_per_day"]
     login_left = max(0, p["login_days_cap"] - int(ac.get("login_claimed", 0)))
     login_granted = 0  # 方案窗口内实际领到的登录奖励次数
     # 负余额=欠费：后端照扣造成的欠费如实保留，收款先还债
     debt = max(0.0, -float(ac.get("balance", 0)))
-    queue = [(start_day, float(ac["balance"]))] if ac["balance"] > 0 else []
+    queue = _initial_queue(ac, p, start_day)  # 勾选今晚过期则余额均分7份、每天过期一份
     packs = []
     events = []
     packable_days = []
@@ -606,7 +638,8 @@ def simulate_big(ac, p, income_by_day, start_day=1, rest_days=None, pack_on_star
         inc = 0.0 if is_rest else income_by_day.get(d, 0.0)
         day_gain = 0.0
         if not is_rest:
-            day_gain = like_gain
+            # 今日已手动点赞 → 首日不重复安排点赞收益（登录奖仍按规则发）
+            day_gain = 0 if (is_first and today_ops.get("like")) else like_gain
             if login_left > 0:
                 day_gain += p["login_bonus"]
                 login_left -= 1
@@ -659,14 +692,19 @@ def simulate_big(ac, p, income_by_day, start_day=1, rest_days=None, pack_on_star
     return packs, events, _total(queue) - debt, login_granted, packable_days, queue
 
 
-def build_plan(accounts, p, ctx=None, pack_on_start=False, works=None):
-    """生成 (完整文本, csv行列表, 分板块列表, 每日动作表, 每日余额曲线, 每日登录曲线, 到期信息)。
+def build_plan(accounts, p, ctx=None, pack_on_start=False, works=None,
+               today_ops=None, manual_batches=None):
+    """生成 (完整文本, csv行列表, 分板块列表, 每日动作表, 每日余额曲线, 每日登录曲线, 到期信息, 作品曲线)。
     每日动作表: {日: {账号备注: [动作, ...]}}，供「确认采用」后主页面每日展示。
     余额/登录曲线: {日: {账号备注: 当天结束值}}，供采用后按日期自动推进当前秒点。
     到期信息: {账号备注: [(获得日, 过期日, 剩余点), ...]}，供到期预警与今日面板提醒。
     works: 大号作品列表 [{name, copies, active}]；缺省按作品数生成默认作品。
+    today_ops: {账号备注: {"like": bool, "copy": int}} 今日已手动操作，首日跳过避免重复。
+    manual_batches: 手动操作产生的大号收款批次，并入方案到期提醒与说明。
     """
     ctx = ctx or month_context()
+    today_ops = today_ops or {}
+    manual_batches = manual_batches or []
     start_day = ctx["start_day"]
     rest_days = ctx.get("rest_days", set())
     # 规划天数强制与「今天到月末」一致，避免残留旧值
@@ -687,14 +725,16 @@ def build_plan(accounts, p, ctx=None, pack_on_start=False, works=None):
     income_by_day = {}
     for ac in smalls:
         copies, ev, author_income, endbal, login_used, q = simulate_small(
-            ac, p, start_day, rest_days, cal=cal, work_state=work_state)
+            ac, p, start_day, rest_days, cal=cal, work_state=work_state,
+            today_ops=today_ops.get(ac["note"], {}))
         small_results.append((ac, copies, ev, author_income, endbal, login_used, q))
         per = p["work_price"] * (1 - p["copy_fee_pct"] / 100.0)
         for d, wi in copies:
             income_by_day[d] = income_by_day.get(d, 0.0) + per
 
     packs, bev, bend, big_login_used, packable_days, bqueue = simulate_big(
-        big, p, income_by_day, start_day, rest_days, pack_on_start, cal=cal)
+        big, p, income_by_day, start_day, rest_days, pack_on_start, cal=cal,
+        today_ops=today_ops.get(big["note"], {}))
 
     # ---- 到期预警：平台优先消耗「即将到期」的秒点；到期没用掉的批次会自然流失 ----
     # 每个批次记录 (获得日, 过期日=获得日+有效期, 剩余点)。当前余额近似按「起始日获得」
@@ -754,6 +794,45 @@ def build_plan(accounts, p, ctx=None, pack_on_start=False, works=None):
         sec_overview += warn_lines
     else:
         sec_overview.append("到期提醒：规划期内没有秒点会到期流失。")
+
+    # 已记录的用户手动操作（永久保留，方案首日已跳过重复安排）
+    if today_ops:
+        done_bits = []
+        for note, op in today_ops.items():
+            bits = []
+            if op.get("like"):
+                bits.append("已点赞")
+            if op.get("copy"):
+                bits.append("已复制%d次" % int(op["copy"]))
+            if op.get("publish"):
+                bits.append("已发布应用")
+            if bits:
+                done_bits.append("%s：%s" % (note, "、".join(bits)))
+        if done_bits:
+            sec_overview.append("★ 你今天已记录的操作（方案首日不重复安排）：" + "；".join(done_bits))
+
+    # 大号快捷收款批次到期：并入方案，方便一眼核对（如3个小号同日复制共240点7天后到期）
+    if manual_batches:
+        # 只显示尚未到期的批次（可能落在下月，不能按方案月末过滤掉）
+        today_date = datetime.date(ctx.get("today_year", ctx["year"]),
+                                   ctx.get("today_month", ctx["month"]),
+                                   ctx.get("today", start_day))
+        mb_by_exp = {}
+        for b in manual_batches:
+            try:
+                exp = datetime.date.fromisoformat(b["expire"])
+                if exp >= today_date:
+                    mb_by_exp.setdefault(exp, []).append((b.get("name", "作品"), float(b["amount"])))
+            except Exception:
+                continue
+        if mb_by_exp:
+            sec_overview.append("★ 大号手动收款到期（已计入当前余额，到期没用会流失）：")
+            for exp in sorted(mb_by_exp)[:4]:
+                items = mb_by_exp[exp]
+                total = round(sum(a for _, a in items), 2)
+                sec_overview.append("  ⚠ %s 00:00：共 %g 点（%s）" %
+                                    (exp.strftime("%Y-%m-%d"), total,
+                                     "、".join("%s%g" % (n, a) for n, a in items[:3])))
 
     # 板块2：首日各号该做什么
     day_label = "明天" if ctx.get("today_done") else "今天"
@@ -1071,8 +1150,41 @@ C_DANGER = "#D92D20"
 FONT = "Microsoft YaHei"
 
 
+def _center_window(win, parent=None, width=None, height=None):
+    """把窗口居中显示。
+
+    parent=None → 相对屏幕正中（用于主窗口）；
+    parent 给定 → 相对父窗口正中（用于软件内弹出的子窗口）。
+    width/height 给定则以该尺寸计算位置，否则用窗口当前实际尺寸。
+    """
+    try:
+        win.update_idletasks()
+        w = width or win.winfo_width()
+        h = height or win.winfo_height()
+        if w < 10:
+            w = 800
+        if h < 10:
+            h = 600
+        if parent is not None:
+            parent.update_idletasks()
+            px, py = parent.winfo_rootx(), parent.winfo_rooty()
+            pw, ph = parent.winfo_width(), parent.winfo_height()
+            x = px + (pw - w) // 2
+            y = py + (ph - h) // 2
+        else:
+            sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+            x = (sw - w) // 2
+            y = (sh - h) // 2
+        x = max(0, x)
+        y = max(0, y)
+        win.geometry("%dx%d+%d+%d" % (w, h, x, y))
+    except Exception:
+        pass
+
+
 class AccountRow:
-    def __init__(self, parent, role, idx, note="", balance=0, login_claimed=0, on_delete=None):
+    def __init__(self, parent, role, idx, note="", balance=0, login_claimed=0,
+                 on_delete=None, expire_today=False):
         self.role = role
         self.frame = tk.Frame(parent, bg=C_SURFACE, highlightthickness=1,
                               highlightbackground=C_BORDER)
@@ -1080,6 +1192,7 @@ class AccountRow:
         self.note_var = tk.StringVar(value=note)
         self.bal_var = tk.StringVar(value=str(balance))
         self.login_var = tk.StringVar(value=str(login_claimed))
+        self.expire_today_var = tk.BooleanVar(value=bool(expire_today))
 
         badge_bg, badge_fg = (("#EEF2FF", "#4338CA") if role == "big"
                               else ("#EFF6FF", "#1D4ED8"))
@@ -1101,12 +1214,19 @@ class AccountRow:
         if role == "small":
             ttk.Button(self.frame, text="删除", width=6, style="Ghost.TButton",
                        command=on_delete).grid(row=0, column=7, padx=(12, 10))
+        # 勾选：今天是否有今晚12点就过期的秒点（用于把当前余额均分7份、推算每天到期）
+        tk.Checkbutton(self.frame, text="今天有今晚12点过期的秒点（当前秒点均分7天、每天过期一份）",
+                       variable=self.expire_today_var, bg=C_SURFACE, fg=C_MUTED,
+                       activebackground=C_SURFACE, selectcolor="#FFFFFF",
+                       font=(FONT, 9), anchor="w", justify="left").grid(
+            row=1, column=0, columnspan=8, padx=(10, 8), pady=(0, 4), sticky="w")
 
     def to_dict(self):
         bal = float(self.bal_var.get() or 0)
         lc = int(self.login_var.get() or 0)
         return {"role": self.role, "note": self.note_var.get().strip() or self.role_var.get(),
-                "balance": bal, "login_claimed": lc}
+                "balance": bal, "login_claimed": lc,
+                "expire_today": bool(self.expire_today_var.get())}
 
 
 class WorkRow:
@@ -1169,6 +1289,7 @@ class App(tk.Tk):
         self._build_style()
         self._build_ui()
         self._auto_load()   # 启动自动恢复上次配置（无则用默认）
+        _center_window(self, parent=None, width=1000, height=920)  # 首次打开居中屏幕
         # 今日执行面板：每 30 秒与窗口重新获得焦点时按系统日期自动刷新
         self._today_key = datetime.date.today().isoformat()
         self._refresh_today_panel()
@@ -1541,11 +1662,7 @@ class App(tk.Tk):
             for b in batches:
                 try:
                     e, a = int(b[1]), float(b[2])
-                    if e <= dim:
-                        edate = datetime.date(y, m, e)
-                    else:
-                        y2, m2 = (y + 1, 1) if m == 12 else (y, m + 1)
-                        edate = datetime.date(y2, m2, e - dim)
+                    edate = _real_date(y, m, e)  # 支持 e<=0 往前跨月（勾选今晚过期的批次）
                     left = (edate - today).days
                     if 0 <= left <= 7:
                         due.setdefault(edate, []).append((note, a))
@@ -1697,11 +1814,7 @@ class App(tk.Tk):
                 for b in batches:
                     try:
                         e, a = int(b[1]), float(b[2])
-                        if e <= days_:
-                            edate = datetime.date(y_, m_, e)
-                        else:
-                            y2, m2 = (y_ + 1, 1) if m_ == 12 else (y_, m_ + 1)
-                            edate = datetime.date(y2, m2, e - days_)
+                        edate = _real_date(y_, m_, e)  # 支持 e<=0 往前跨月
                     except Exception:
                         continue
                     if edate == day_obj:
@@ -1749,12 +1862,14 @@ class App(tk.Tk):
             # 用采用时的起始余额/登录天数覆盖，还原当初生成方案的输入
             start_bal = plan.get("start_bal", {})
             start_login = plan.get("start_login", {})
+            start_exp = plan.get("expire_today", {})
             restored = []
             for a in accounts:
                 if a["note"] in start_bal:
                     b = dict(a)
                     b["balance"] = start_bal[a["note"]]
                     b["login_claimed"] = int(start_login.get(a["note"], 0))
+                    b["expire_today"] = bool(start_exp.get(a["note"], False))
                     restored.append(b)
             py, pm = int(plan["year"]), int(plan["month"])
             ps, pe = int(plan["start_day"]), int(plan["end_day"])
@@ -1770,7 +1885,9 @@ class App(tk.Tk):
             }
             text, rows, _secs, _acts, _bal, _login, _exp, _wcc = build_plan(
                 restored, p, ctx, pack_on_start=bool(plan.get("packed_on_start", False)),
-                works=plan.get("works") or getattr(self, "works", None))
+                works=plan.get("works") or getattr(self, "works", None),
+                today_ops=plan.get("today_ops") or {},
+                manual_batches=plan.get("manual_batches") or [])
             plan["text"] = text
             plan["rows"] = rows
             self._auto_save()
@@ -1800,7 +1917,9 @@ class App(tk.Tk):
             }
             _text, _rows, _secs, _acts, bal_curve, login_curve, _exp, _wcc = build_plan(
                 accounts, p, ctx, pack_on_start=bool(plan.get("packed_on_start", False)),
-                works=plan.get("works") or getattr(self, "works", None))
+                works=plan.get("works") or getattr(self, "works", None),
+                today_ops=plan.get("today_ops") or {},
+                manual_batches=plan.get("manual_batches") or [])
             plan["balance_curve"] = {str(d): dict(v) for d, v in bal_curve.items()}
             plan["login_curve"] = {str(d): dict(v) for d, v in login_curve.items()}
             plan["start_bal"] = {a["note"]: float(a["balance"]) for a in accounts}
@@ -2062,8 +2181,10 @@ class App(tk.Tk):
             pass
 
     def _bind_row_saves(self, row):
-        for var in (row.note_var, row.bal_var, row.login_var):
-            var.trace_add("write", self._schedule_save)
+        for var in (row.note_var, row.bal_var, row.login_var,
+                    getattr(row, "expire_today_var", None)):
+            if var is not None:
+                var.trace_add("write", self._schedule_save)
 
     def _on_switch_changed(self):
         self._refresh_date_bar()
@@ -2196,6 +2317,33 @@ class App(tk.Tk):
             return int(v) if v == int(v) else v
         except Exception:
             return default
+
+    def _today_manual_ops(self):
+        """从操作记录提取「今天已手动做过什么」，供生成方案首日跳过、避免重复安排。
+        返回 {账号备注: {"like": bool, "copy": int, "publish": bool}}。
+        记录永久保留在 change_log，本方法只读不改。"""
+        today = datetime.date.today().isoformat()
+        out = {}
+        for e in getattr(self, "change_log", []) or []:
+            try:
+                if e.get("source") != "manual":
+                    continue
+                ts = str(e.get("ts", ""))
+                if not ts.startswith(today):
+                    continue
+                note = e.get("note", "")
+                reason = str(e.get("reason", ""))
+                delta = float(e.get("delta", 0))
+                slot = out.setdefault(note, {"like": False, "copy": 0, "publish": False})
+                if reason.startswith("已点赞"):
+                    slot["like"] = True
+                elif reason.startswith("发布应用"):
+                    slot["publish"] = True
+                elif reason.startswith("复制") and delta < 0:
+                    slot["copy"] += 1
+            except Exception:
+                continue
+        return out
 
     def _log_manual(self, note, delta, reason, big_gain=0.0, work_name="", from_note=""):
         """记一笔快捷操作：改账号余额 + change_log + （大号收款）手动批次。"""
@@ -2373,6 +2521,7 @@ class App(tk.Tk):
 
         ttk.Button(bfr, text="确定", style="Primary.TButton", command=_ok).pack(side="left", padx=6)
         ttk.Button(bfr, text="取消", command=win.destroy).pack(side="left")
+        _center_window(win, parent=self)  # 内容自适应后相对主窗口居中
         self.wait_window(win)
         return result["work"]
 
@@ -2380,9 +2529,9 @@ class App(tk.Tk):
         self._refresh_quick_hint()
 
     # ---- 账号行管理 ----
-    def add_row(self, role, idx, note, balance, login_claimed):
+    def add_row(self, role, idx, note, balance, login_claimed, expire_today=False):
         row = AccountRow(self.acc_list, role, idx, note, balance, login_claimed,
-                         on_delete=lambda r=None: None)
+                         on_delete=lambda r=None: None, expire_today=expire_today)
         row.frame.pack(fill="x", pady=4)
         if role == "small":
             row.frame.configure  # noqa
@@ -2459,8 +2608,11 @@ class App(tk.Tk):
         """按当前界面生成一份完整方案快照（不弹窗、不采用）。"""
         accounts, p = self.collect()
         works = self._collect_works()
+        today_ops = self._today_manual_ops()       # 今日已手动操作（记录只读，永久保留）
+        manual_batches = getattr(self, "manual_batches", [])  # 大号手动收款批次
         text, rows, _sections, actions, balance_curve, login_curve, expiry, work_copy_curve = build_plan(
-            accounts, p, self.ctx, pack_on_start=self.pack_today_var.get(), works=works)
+            accounts, p, self.ctx, pack_on_start=self.pack_today_var.get(), works=works,
+            today_ops=today_ops, manual_batches=manual_batches)
         self.last_rows = rows
         c = self.ctx
         return {
@@ -2474,10 +2626,13 @@ class App(tk.Tk):
             "expiry_info": {k: [list(b) for b in v] for k, v in expiry.items()},
             "start_bal": {a["note"]: float(a["balance"]) for a in accounts},
             "start_login": {a["note"]: int(a.get("login_claimed", 0)) for a in accounts},
+            "expire_today": {a["note"]: bool(a.get("expire_today", False)) for a in accounts},
             "login_cap": int(p["login_days_cap"]),
             "packed_on_start": bool(self.pack_today_var.get()),
             "works": works,                     # 方案采用时的作品快照（名称/累计次数）
             "work_copy_curve": {str(d): dict(v) for d, v in work_copy_curve.items()},
+            "today_ops": today_ops,             # 今日已手动操作（生成时用于首日跳过）
+            "manual_batches": [dict(b) for b in manual_batches],  # 大号收款批次快照
         }
 
     def on_generate(self):
@@ -2528,6 +2683,7 @@ class App(tk.Tk):
         win.configure(bg=C_BG)
         win.geometry("1040x860")
         win.minsize(760, 560)
+        _center_window(win, parent=self, width=1040, height=860)  # 相对主窗口居中
 
         bar = tk.Frame(win, bg=C_SURFACE, highlightthickness=1,
                        highlightbackground=C_BORDER)
@@ -2883,6 +3039,7 @@ class App(tk.Tk):
             win.configure(bg=C_BG)
             win.geometry("960x760")
             win.minsize(760, 560)
+            _center_window(win, parent=self, width=960, height=760)
 
             bar = tk.Frame(win, bg=C_SURFACE, highlightthickness=1,
                            highlightbackground=C_BORDER)
@@ -2963,6 +3120,7 @@ class App(tk.Tk):
         win.configure(bg=C_BG)
         win.geometry("1080x860")
         win.minsize(780, 580)
+        _center_window(win, parent=self, width=1080, height=860)
 
         bar = tk.Frame(win, bg=C_SURFACE, highlightthickness=1,
                        highlightbackground=C_BORDER)
@@ -3175,12 +3333,14 @@ class App(tk.Tk):
         has_big = False
         for a in data["accounts"]:
             if a["role"] == "big":
-                self.add_row("big", 0, a["note"], a["balance"], a.get("login_claimed", 0))
+                self.add_row("big", 0, a["note"], a["balance"], a.get("login_claimed", 0),
+                             expire_today=a.get("expire_today", False))
                 has_big = True
             else:
                 self.small_counter += 1
                 nr = self.add_row("small", self.small_counter,
-                                  a["note"], a["balance"], a.get("login_claimed", 0))
+                                  a["note"], a["balance"], a.get("login_claimed", 0),
+                                  expire_today=a.get("expire_today", False))
                 btn = nr.frame.grid_slaves(row=0, column=7)
                 if btn:
                     btn[0].configure(command=lambda rr=nr: self.delete_row(rr))
@@ -3375,6 +3535,7 @@ class App(tk.Tk):
         win.configure(bg=C_SURFACE)
         win.geometry("400x170")
         win.transient(self)
+        _center_window(win, parent=self, width=400, height=170)
         tk.Label(win, text="新版本已安装完成！", bg=C_SURFACE, fg=C_INK,
                  font=(FONT, 13, "bold")).pack(pady=(22, 6))
         tk.Label(win, text="是否立即重启以使用新版本？", bg=C_SURFACE, fg=C_MUTED,

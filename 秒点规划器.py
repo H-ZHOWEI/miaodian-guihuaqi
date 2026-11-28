@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-秒点规划器 v1.19.0
+秒点规划器 v1.20.0
 根据每个账号当前秒点余额，模拟并生成「点赞 / 登录领奖 / 复制转账 / 打包」的执行方案。
 用 Python 3.12 + tkinter，可打包为单文件 exe。
 """
@@ -25,7 +25,7 @@ import datetime
 import calendar
 
 APP_NAME = "秒点规划器"
-VERSION = "1.19.0"
+VERSION = "1.20.0"
 APP_VERSION = VERSION   # 版本更新模块使用
 
 # ===== 内置「版本更新」配置 =====
@@ -1377,48 +1377,16 @@ class App(tk.Tk):
                  fg="#9FB3CC", font=(FONT, 9)).pack(anchor="w")
         right = tk.Frame(head, bg=C_NAVY)
         right.pack(side="right", padx=(0, 14))
-        self.ver_label = tk.Label(right, text="v" + APP_VERSION, bg="#334155", fg="#E2E8F0",
-                                  font=(FONT, 9, "bold"), padx=8, pady=3, cursor="hand2")
-        self.ver_label.pack(side="left", padx=(0, 10))
-        self.ver_label.bind("<Button-1>", lambda e: self._check_update(manual=True))
-        self.update_btn = self._header_button(right, "检查更新",
-                                              lambda: self._check_update(manual=True))
-        self.update_btn.pack(side="left", padx=(0, 10))
-        self.update_status = tk.Label(right, text="", bg=C_NAVY, fg="#94A3B8",
-                                      font=(FONT, 9))
-        self.update_status.pack(side="left", padx=(0, 8))
-        self.restore_src_btn = self._header_button(right, "恢复默认更新地址",
-                                                   self._restore_default_source)
-        if load_update_config().get("source"):
-            self.restore_src_btn.pack(side="left", padx=(0, 6))
-
-        # ===== 非模态更新横幅（默认隐藏，发现新版时弹出）=====
-        b = tk.Frame(self, bg="#FFFAEB", highlightthickness=1, highlightbackground="#FEDF89")
-        b.pack(fill="x", pady=(10, 0))
-        b.pack_forget()
-        self.banner = b
-        inner = tk.Frame(b, bg="#FFFAEB")
-        inner.pack(fill="x", padx=12, pady=8)
-        self.banner_text = tk.Label(inner, text="", bg="#FFFAEB", fg="#93370D",
-                                    font=(FONT, 10, "bold"))
-        self.banner_text.pack(side="left")
-        self.banner_notes = tk.Label(inner, text="", bg="#FFFAEB", fg="#B54708",
-                                     font=(FONT, 9))
-        self.banner_notes.pack(side="left", padx=8)
-        self.banner_stage = tk.Label(inner, text="", bg="#FFFAEB", fg="#B54708",
-                                     font=(FONT, 9))
-        self.banner_stage.pack(side="left", padx=8)
-        self.banner_pb = ttk.Progressbar(inner, orient="horizontal",
-                                         mode="determinate", maximum=1)
-        bf = tk.Frame(inner, bg="#FFFAEB")
-        bf.pack(side="right")
-        self.btn_now = ttk.Button(bf, text="立即更新", style="Primary.TButton",
-                                  command=self._start_download)
-        self.btn_now.pack(side="left", padx=3)
-        self.btn_skip = ttk.Button(bf, text="跳过此版本", command=self._on_skip)
-        self.btn_skip.pack(side="left", padx=3)
-        self.btn_later = ttk.Button(bf, text="稍后再说", command=self._on_later)
-        self.btn_later.pack(side="left", padx=3)
+        # 顶部只保留一个入口：所有更新信息与操作都在独立窗口里
+        self.update_entry = self._header_button(
+            right, "v%s · 更新" % APP_VERSION, self._open_update_window)
+        self.update_entry.pack(side="left", padx=(0, 6))
+        self.update_win = None
+        # 更新窗口内容先记在缓存里：启动检查可能在窗口创建前就拿到结果，
+        # 等窗口一建好立即回填，避免自动弹出时显示「尚未检查」。
+        self.update_view = {"status": "尚未检查", "color": C_MUTED, "latest": "尚未检查",
+                            "source": "—", "notes": "", "check": True,
+                            "now": False, "skip": False, "later": False}
 
         # ===== 可滚动主区域：内容再多也不会被窗口截断 =====
         wrap = tk.Frame(self, bg=C_BG)
@@ -3697,13 +3665,181 @@ class App(tk.Tk):
         else:
             self._load_defaults()
 
-    # ===== 内置版本更新：检查 / 横幅 / 下载 / 安装 / 重启 =====
+    # ===== 内置版本更新：独立窗口 / 检查 / 下载 / 安装 / 重启 =====
+    def _open_update_window(self, focus=True):
+        """打开/复用独立更新窗口：非模态、不 grab，随时可切回主窗口。"""
+        win = getattr(self, "update_win", None)
+        if win is None or not bool(win.winfo_exists()):
+            win = self._build_update_window()
+            self.update_win = win
+        win.deiconify()
+        if focus:
+            win.lift()
+            try:
+                win.focus_force()
+            except Exception:
+                pass
+
+    def _build_update_window(self):
+        win = tk.Toplevel(self)
+        win.title("检查更新")
+        win.configure(bg=C_SURFACE)
+        win.resizable(False, False)
+        win.protocol("WM_DELETE_WINDOW", win.withdraw)
+
+        head = tk.Frame(win, bg=C_NAVY, height=52)
+        head.pack(fill="x")
+        head.pack_propagate(False)
+        tk.Label(head, text="检查更新", bg=C_NAVY, fg="#FFFFFF",
+                 font=(FONT, 13, "bold")).pack(side="left", padx=18)
+        tk.Label(head, text="更新信息集中在这里，不遮挡主界面", bg=C_NAVY,
+                 fg="#9FB3CC", font=(FONT, 9)).pack(side="left")
+
+        box = tk.Frame(win, bg=C_SURFACE, highlightthickness=1,
+                       highlightbackground=C_BORDER)
+        box.pack(fill="both", expand=True, padx=16, pady=(14, 8))
+        info = tk.Frame(box, bg=C_SURFACE)
+        info.pack(fill="x", padx=16, pady=(14, 6))
+        self.uw_current = tk.Label(info, text="当前版本：v%s" % APP_VERSION,
+                                   bg=C_SURFACE, fg=C_INK, font=(FONT, 10, "bold"))
+        self.uw_current.pack(anchor="w")
+        self.uw_latest = tk.Label(info, text="线上版本：尚未检查", bg=C_SURFACE,
+                                  fg=C_MUTED, font=(FONT, 10))
+        self.uw_latest.pack(anchor="w", pady=(4, 0))
+        self.uw_source = tk.Label(info, text="命中来源：—", bg=C_SURFACE,
+                                  fg=C_MUTED, font=(FONT, 9))
+        self.uw_source.pack(anchor="w", pady=(2, 0))
+        self.uw_status = tk.Label(info, text="状态：尚未检查", bg=C_SURFACE,
+                                  fg=C_MUTED, font=(FONT, 10))
+        self.uw_status.pack(anchor="w", pady=(8, 0))
+
+        tk.Label(box, text="版本说明", bg=C_SURFACE, fg=C_MUTED,
+                 font=(FONT, 9, "bold")).pack(anchor="w", padx=16, pady=(8, 2))
+        self.uw_notes = scrolledtext.ScrolledText(
+            box, height=5, wrap="word", font=(FONT, 9), bg="#FFFFFF", fg=C_INK,
+            relief="flat", borderwidth=1, highlightbackground=C_BORDER)
+        self.uw_notes.pack(fill="both", expand=True, padx=16)
+        self.uw_notes.configure(state="disabled")
+
+        prog = tk.Frame(box, bg=C_SURFACE)
+        prog.pack(fill="x", padx=16, pady=(10, 4))
+        self.uw_stage = tk.Label(prog, text="", bg=C_SURFACE, fg=C_MUTED,
+                                 font=(FONT, 9), anchor="w")
+        self.uw_stage.pack(fill="x")
+        self.uw_pb = ttk.Progressbar(prog, orient="horizontal",
+                                     mode="determinate", maximum=1)
+        self.uw_pb.pack(fill="x", pady=(4, 0))
+
+        bar = tk.Frame(win, bg=C_SURFACE)
+        bar.pack(fill="x", padx=16, pady=(4, 14))
+        self.uw_check = ttk.Button(bar, text="检查更新",
+                                   command=lambda: self._check_update(manual=True))
+        self.uw_check.pack(side="left")
+        self.uw_restore = ttk.Button(bar, text="恢复默认更新地址",
+                                     command=self._restore_default_source)
+        self.uw_now = ttk.Button(bar, text="立即更新", style="Primary.TButton",
+                                 command=self._start_download, state="disabled")
+        self.uw_skip = ttk.Button(bar, text="跳过此版本",
+                                  command=self._on_skip, state="disabled")
+        self.uw_later = ttk.Button(bar, text="稍后再说",
+                                   command=self._on_later, state="disabled")
+        self._uw_apply_state()
+        _center_window(win, parent=self, width=640, height=520)
+        win.withdraw()
+        return win
+
+    def _uw_apply_state(self):
+        """把缓存的更新状态回填到独立窗口（窗口可能刚被自动创建）。"""
+        v = getattr(self, "update_view", None)
+        if not v:
+            return
+        w = getattr(self, "uw_latest", None)
+        if w is not None:
+            w.config(text="线上版本：" + str(v.get("latest") or "尚未检查"))
+        w = getattr(self, "uw_source", None)
+        if w is not None:
+            w.config(text="命中来源：" + str(v.get("source") or "—"))
+        w = getattr(self, "uw_status", None)
+        if w is not None:
+            w.config(text="状态：" + str(v.get("status") or ""), fg=v.get("color") or C_MUTED)
+        self._uw_set_notes(v.get("notes") or "")
+        self._uw_buttons(check=v.get("check", True), now=v.get("now", False),
+                         skip=v.get("skip", False), later=v.get("later", False))
+        rest = getattr(self, "uw_restore", None)
+        if rest is not None:
+            if load_update_config().get("source"):
+                if not rest.winfo_manager():
+                    rest.pack(side="left", padx=8)
+            else:
+                rest.pack_forget()
+
+    def _uw_set_status(self, text, color=None):
+        v = getattr(self, "update_view", None)
+        if v is not None:
+            v["status"] = text
+            v["color"] = color or C_MUTED
+        w = getattr(self, "uw_status", None)
+        if w is not None:
+            w.config(text="状态：" + text, fg=color or C_MUTED)
+
+    def _uw_set_latest(self, text):
+        v = getattr(self, "update_view", None)
+        if v is not None:
+            v["latest"] = text
+        w = getattr(self, "uw_latest", None)
+        if w is not None:
+            w.config(text="线上版本：" + str(text))
+
+    def _uw_set_source(self, text):
+        v = getattr(self, "update_view", None)
+        if v is not None:
+            v["source"] = text
+        w = getattr(self, "uw_source", None)
+        if w is not None:
+            w.config(text="命中来源：" + str(text))
+
+    def _uw_set_notes(self, text):
+        v = getattr(self, "update_view", None)
+        if v is not None:
+            v["notes"] = text or ""
+        w = getattr(self, "uw_notes", None)
+        if w is None:
+            return
+        w.configure(state="normal")
+        w.delete("1.0", "end")
+        w.insert("1.0", text or "（本次更新没有说明）")
+        w.configure(state="disabled")
+
+    def _uw_buttons(self, check=None, now=False, skip=False, later=False):
+        """统一控制更新窗口按钮状态；check=None 表示保持原样。"""
+        v = getattr(self, "update_view", None)
+        if v is not None:
+            if check is not None:
+                v["check"] = check
+            v["now"], v["skip"], v["later"] = now, skip, later
+        if check is not None:
+            w = getattr(self, "uw_check", None)
+            if w is not None:
+                w.config(state="normal" if check else "disabled")
+        for key, on in (("uw_now", now), ("uw_skip", skip), ("uw_later", later)):
+            w = getattr(self, key, None)
+            if w is not None:
+                w.config(state="normal" if on else "disabled")
+
+    def _set_update_entry_alert(self, on):
+        e = getattr(self, "update_entry", None)
+        if e is not None:
+            e.config(fg="#FBBF24" if on else "#E2E8F0")
+
     def _check_update(self, manual=False):
         cfg = load_update_config()
         source = cfg.get("source") or UPDATE_MANIFEST_PRIMARY
         urls = _mirror_urls(source)
-        self.update_status.config(text="检查更新中…", fg="#94A3B8")
-        self.update_btn.config(state=tk.DISABLED)
+        if manual:
+            self._open_update_window(focus=True)
+        self._uw_set_status("检查更新中…", "#94A3B8")
+        self._uw_buttons(check=False)
+        self._uw_set_source("检查中…")
 
         def worker():
             if _UPDATE_SKIP_NETWORK:
@@ -3715,29 +3851,38 @@ class App(tk.Tk):
         threading.Thread(target=worker, daemon=True).start()
 
     def _on_manifest(self, manifest, hit_source, manual):
-        self.update_btn.config(state=tk.NORMAL)
+        self._uw_buttons(check=True)
         if not manifest:
-            self.update_status.config(text="检查失败（网络/地址）", fg="#94A3B8")
-            if manual:
-                messagebox.showwarning("检查更新", "暂时无法连接更新服务器，请稍后再试。")
+            self._uw_set_status("检查失败（网络或地址），请稍后再试。", "#F87171")
             return
         latest = manifest.get("version", "0")
-        self.update_status.config(text="线上 v%s · %s" % (latest, self._short_source(hit_source)),
-                                  fg="#94A3B8")
+        self._uw_set_latest("v%s" % latest)
+        self._uw_set_source(self._short_source(hit_source) or "—")
+        self._uw_set_notes(manifest.get("notes", ""))
         if cmp_version(latest, APP_VERSION) > 0:
-            self.update_status.config(fg="#FBBF24")   # 有新版本 → 橙色提示
             cfg = load_update_config()
             # 跳过此版本：仅启动检查生效，且只对该版本
             if (not manual) and cfg.get("skip_version") == latest:
+                self._uw_set_status("发现新版本 v%s（已跳过，不再提醒）" % latest, "#94A3B8")
                 return
-            self._show_banner(manifest, hit_source, manual)
-        elif manual:
-            messagebox.showinfo("检查更新", "当前已是最新版本（v%s）。" % APP_VERSION)
+            self.update_manifest = manifest
+            self.update_version = latest
+            self._uw_set_status("发现新版本 v%s%s" % (
+                latest, "（重要更新）" if manifest.get("mandatory") else ""), "#FBBF24")
+            self._uw_buttons(now=True, skip=not manual, later=True)
+            self._set_update_entry_alert(True)
+            self._open_update_window(focus=manual)
+        else:
+            self._uw_set_status("当前已是最新版本（v%s）。" % APP_VERSION, "#94A3B8")
+            self._uw_buttons(now=False, skip=False, later=False)
+            self._set_update_entry_alert(False)
 
     @staticmethod
     def _short_source(url):
         if not url:
             return ""
+        if "127.0.0.1" in url or "localhost" in url:
+            return "本地测试"
         if "ghproxy.net" in url:
             return "ghproxy"
         if "gh-proxy.com" in url:
@@ -3746,41 +3891,24 @@ class App(tk.Tk):
             return "github/raw"
         return "raw"
 
-    def _show_banner(self, manifest, hit_source, manual):
-        self.banner_version = manifest.get("version")
-        self.banner_manifest = manifest
-        notes = manifest.get("notes", "")
-        self.banner_text.config(text="发现新版本 v%s%s" % (
-            self.banner_version, "（重要更新）" if manifest.get("mandatory") else ""))
-        self.banner_notes.config(text=(notes[:120] + ("…" if len(notes) > 120 else ""))
-                                 if notes else "")
-        self.banner_stage.config(text="")
-        self.banner_pb.pack_forget()
-        self.banner.pack(fill="x", before=self._main_wrap)
-        # 跳过此版本只对启动检查生效
-        self.btn_skip.config(state=tk.DISABLED if manual else tk.NORMAL)
-        self.btn_now.config(state=tk.NORMAL)
-        self.btn_later.config(state=tk.NORMAL)
-
     def _start_download(self):
-        m = getattr(self, "banner_manifest", None)
+        m = getattr(self, "update_manifest", None)
         if not m:
             return
-        self.banner_pb.pack(fill="x", padx=10, pady=(2, 6))
-        self.banner_pb["value"] = 0
-        self.banner_pb["maximum"] = 1
-        self.banner_stage.config(text="准备下载…")
-        self.btn_now.config(state=tk.DISABLED)
-        self.btn_skip.config(state=tk.DISABLED)
-        self.btn_later.config(state=tk.DISABLED)
+        self._uw_set_status("准备下载…", "#94A3B8")
+        pb = getattr(self, "uw_pb", None)
+        if pb is not None:
+            pb.pack(fill="x", pady=(4, 0))
+            pb.config(maximum=1, value=0)
+        self._uw_buttons(now=False, skip=False, later=False)
 
         def on_progress(done, total):
             self.after(0, lambda: [
-                self.banner_pb.config(maximum=total or 1, value=done),
-                self.banner_stage.config(text="下载中 %.0f%%" % (done / (total or 1) * 100))])
+                self.uw_pb.config(maximum=total or 1, value=done),
+                self.uw_stage.config(text="下载中 %.0f%%" % (done / (total or 1) * 100))])
 
         def on_stage(t):
-            self.after(0, lambda: self.banner_stage.config(text=t))
+            self.after(0, lambda: self.uw_stage.config(text=t))
 
         def worker():
             dest = os.path.join(_app_dir(), "_update_tmp.exe")
@@ -3799,20 +3927,18 @@ class App(tk.Tk):
 
     def _on_download_done(self, ok, msg, dest):
         if not ok:
-            self.banner_stage.config(text="下载失败：" + msg)
-            self.btn_now.config(state=tk.NORMAL)
-            self.btn_later.config(state=tk.NORMAL)
-            self.btn_skip.config(state=tk.NORMAL)
-            messagebox.showerror("更新失败", "下载未成功：" + msg + "\n可点「立即更新」重试。")
+            self._uw_set_status("下载失败：%s（可点「立即更新」重试）" % msg, "#D92D20")
+            self._uw_buttons(now=True, skip=True, later=True)
             return
-        self.banner_stage.config(text="下载完成，正在安装替换…")
+        self._uw_set_status("下载完成，正在安装替换…", "#94A3B8")
         ok2, msg2 = install_update(dest)
         if not ok2:
-            self.banner_stage.config(text="安装失败：" + msg2)
-            self.btn_now.config(state=tk.NORMAL)
-            messagebox.showerror("安装失败", msg2)
+            self._uw_set_status("安装失败：%s" % msg2, "#D92D20")
+            self._uw_buttons(now=True)
             return
-        self.banner.pack_forget()
+        win = getattr(self, "update_win", None)
+        if win is not None:
+            win.withdraw()
         self._ask_restart()
 
     def _ask_restart(self):
@@ -3834,24 +3960,43 @@ class App(tk.Tk):
                    command=win.destroy).pack(side="left", padx=8)
 
     def _on_skip(self):
-        v = getattr(self, "banner_version", None)
+        v = getattr(self, "update_version", None)
         if v:
             cfg = load_update_config()
             cfg["skip_version"] = v
             save_update_config(cfg)
-        self.banner.pack_forget()
+        self._uw_set_status("已跳过此版本，下次启动不再提醒。", "#94A3B8")
+        self._uw_buttons(now=False, skip=False, later=False)
+        self._set_update_entry_alert(False)
+        win = getattr(self, "update_win", None)
+        if win is not None:
+            win.withdraw()
 
     def _on_later(self):
-        self.banner.pack_forget()
+        win = getattr(self, "update_win", None)
+        if win is not None:
+            win.withdraw()
 
     def _restore_default_source(self):
         cfg = load_update_config()
         cfg["source"] = None
         save_update_config(cfg)
-        self.restore_src_btn.pack_forget()
-        self.update_status.config(text="已恢复默认更新地址", fg="#94A3B8")
+        b = getattr(self, "uw_restore", None)
+        if b is not None:
+            b.pack_forget()
+        self._uw_set_source("默认地址")
+        self._uw_set_status("已恢复默认更新地址，可点「检查更新」重新检查。", "#94A3B8")
 
     def _on_close(self):
+        # 独立更新窗口随主窗口一起关闭，避免留下孤立窗口
+        w = getattr(self, "update_win", None)
+        if w is not None:
+            try:
+                if bool(w.winfo_exists()):
+                    w.destroy()
+            except Exception:
+                pass
+            self.update_win = None
         # 取消尚未触发的防抖保存，避免销毁后回调报错
         if getattr(self, "_save_job", None):
             try:

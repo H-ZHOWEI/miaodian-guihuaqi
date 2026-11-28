@@ -1,9 +1,9 @@
 {
-  "version": "1.19.0",
+  "version": "1.20.0",
   "download_url": "https://raw.githubusercontent.com/H-ZHOWEI/miaodian-guihuaqi/main/dist/%E7%A7%92%E7%82%B9%E8%A7%84%E5%88%92%E5%99%A8.exe",
-  "notes": "快捷操作新增撤回（整笔回退秒点/收款批次/作品次数，原记录保留并另记反向流水）；点赞与复制同一账号每天只记一次；已复制大号作品仅小号可操作。",
-  "sha256": "abda6d1fd73a6512a05965d89ba16e84db737473eea7fb46632798440b1d5e51",
-  "size": 11021417,
+  "notes": "更新信息改为独立窗口：主窗口只留「v1.20.0 · 更新」入口；检查更新、线上版本/来源、版本说明、下载进度与更新操作全部集中到非模态独立窗口，发现新版入口橙色提醒。",
+  "sha256": "87adc730adae4e59cd3a03b78b8d0f2834ba08c67a1f911179b880b5e7faa2af",
+  "size": 11023463,
   "pub_date": "2026-11-28",
   "mandatory": false
 }
